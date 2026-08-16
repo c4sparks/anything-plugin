@@ -1,0 +1,12 @@
+{
+  "id": "demo-note",
+  "name": "便签",
+  "version": "1.0.0",
+  "description": "内容区便签：编辑内容自动保存在本地",
+  "publisher": "AnythingPlugin",
+  "tag": "app-plugin-demo-note",
+  "slot": "content",
+  "order": 30,
+  "entry": "entry.js",
+  "icon": "icon.svg"
+}

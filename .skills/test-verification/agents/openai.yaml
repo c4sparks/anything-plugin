@@ -1,0 +1,4 @@
+interface:
+  display_name: "测试验证"
+  short_description: "项目测试与验证规范：基线命令、临时验证流程与留存纪律"
+  default_prompt: "Use $test-verification to run and record verification for this project"

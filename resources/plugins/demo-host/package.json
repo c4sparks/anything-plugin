@@ -1,0 +1,8 @@
+{
+  "name": "demo-host",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "lib/bin.js",
+  "bin": { "demo-host": "lib/bin.js" }
+}

@@ -1,0 +1,26 @@
+{
+  "id": "demo-host",
+  "name": "Demo Host",
+  "kind": "hostApp",
+  "slot": "content",
+  "shortName": "Demo",
+  "iconName": "box",
+  "description": "外部宿主应用示例：最小 HTTP 服务（插件目录自包含，离线可用）",
+  "version": "1.0.0",
+  "publisher": "demo",
+  "homepage": "https://example.com/demo-host",
+  "repository": "https://example.com/demo-host",
+  "license": "MIT",
+  "tags": ["demo", "host"],
+  "hostApp": {
+    "packageName": "demo-host",
+    "hostDir": ".",
+    "hostBin": "lib/bin.js",
+    "cliArgs": ["--port", "0"],
+    "readyRe": "demo-host: http://127\\.0\\.0\\.1:(\\d+)",
+    "dataHomeEnv": "DEMO_HOST_HOME",
+    "dataDir": "demo-host",
+    "runtimeDir": "demo-host-runtime",
+    "extraEnv": {}
+  }
+}

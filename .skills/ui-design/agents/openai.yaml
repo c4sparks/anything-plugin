@@ -1,0 +1,4 @@
+interface:
+  display_name: "UI 设计"
+  short_description: "仪器面板设计令牌与 Element Plus 用法"
+  default_prompt: "Use $ui-design to build UI consistent with the design system"

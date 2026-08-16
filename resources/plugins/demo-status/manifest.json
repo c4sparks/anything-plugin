@@ -1,0 +1,11 @@
+{
+  "id": "demo-status",
+  "name": "状态提示",
+  "version": "1.0.0",
+  "description": "状态栏部件：实时显示应用已运行时长",
+  "publisher": "AnythingPlugin",
+  "tag": "app-plugin-demo-status",
+  "slot": "statusbar",
+  "order": 10,
+  "entry": "entry.js"
+}

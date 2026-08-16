@@ -1,0 +1,4 @@
+interface:
+  display_name: "插件开发"
+  short_description: "webComponent/hostApp 插件开发与数据契约"
+  default_prompt: "Use $plugin-development to build or fix a plugin in this project"

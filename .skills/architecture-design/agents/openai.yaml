@@ -1,0 +1,4 @@
+interface:
+  display_name: "架构设计"
+  short_description: "架构/功能/详细设计文档体系与文档先行、契约演进规范"
+  default_prompt: "Use $architecture-design to plan or write design docs for this project"

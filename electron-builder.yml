@@ -1,0 +1,61 @@
+appId: com.anything.app
+productName: AnythingPlugin
+directories:
+  buildResources: build
+  output: dist
+files:
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!plugins-dev/**'
+  - '!docs/*'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  - '!{.eslintrc*,eslint.config.*,.prettierrc*,.prettierignore,.npmrc,pnpm-workspace.yaml,pnpm-lock.yaml}'
+  - '!{CHANGELOG.md,README.md}'
+  - '!{.gitignore,.git,LICENSE}'
+  # 图标等构建资源在 build/（buildResources），不进 asar（运行时经 extraResources 读 resources 根）
+  - '!build/**'
+  # dsh 闭包只在侧车（extraResources），不进 asar（侧车是独立 node 进程，读不了 asar；避免 1.1GB 重复打包）
+  - '!node_modules/@deepseek-ai/**'
+# 侧车运行时（重命名 Node + 自包含闭包）部署到 resources/dsh-host，先跑 pnpm package:sidecar；
+# 应用图标从 build/（buildResources）部署到 resources 根（主进程 appIconPath 运行时读取；Windows 用 .ico）
+extraResources:
+  - from: resources/dsh-host
+    to: dsh-host
+    filter: ['**/*']
+  - from: build/icon.png
+    to: icon.png
+  - from: build/icon.ico
+    to: icon.ico
+win:
+  executableName: anythingplugin
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  artifactName: ${name}-${version}-setup.${ext}
+  shortcutName: ${productName}
+  uninstallDisplayName: ${productName}
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  # 卸载器自定义：询问是否同时清除应用数据（%APPDATA%/anythingplugin）
+  include: build/nsis/uninstall-app-data.nsh
+mac:
+  target:
+    - dmg
+  artifactName: ${name}-${version}.${ext}
+linux:
+  target:
+    - AppImage
+  category: Utility
+appImage:
+  artifactName: ${name}-${version}.${ext}
+npmRebuild: false
+
+# Electron 二进制下载：跳过 SHASUMS256.txt 校验下载。
+# zip 已缓存时仍会强制联网拉校验文件，网络抖动会直接导致打包失败；
+# 关闭后命中本地缓存即可离线打包（缓存文件本身在首次下载时已校验过）。
+electronDownload:
+  isVerifyChecksum: false

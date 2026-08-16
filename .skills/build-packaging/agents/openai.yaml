@@ -1,0 +1,4 @@
+interface:
+  display_name: "构建打包"
+  short_description: "项目构建打包：sidecar 自动准备、NSIS 安装包与常见坑"
+  default_prompt: "Use $build-packaging to package the project and resolve build issues"

@@ -1,0 +1,16 @@
+# pnpm 11 设置（package.json 的 pnpm 字段已废弃，统一在此配置）
+# 放行需要运行构建脚本的依赖（electron 下载二进制 / esbuild 安装）
+allowBuilds:
+  electron: true
+  esbuild: true
+  electron-winstaller: true
+  '@deepseek-ai/dsh-subprocess-local': true
+  '@google/genai': true
+  koffi: true
+  node-pty: true
+  protobufjs: true
+
+# 修复 electron-builder 26.15.3 的依赖范围 bug：
+# 其代码使用 @electron/get>=5 的 ElectronDownloadCacheMode，但声明了 ^3.0.0，强制对齐到 5.x
+overrides:
+  '@electron/get': ^5.1.0

@@ -1,0 +1,4 @@
+interface:
+  display_name: "变更留痕"
+  short_description: "CHANGELOG/CHAT 留痕规范：只增不改、时间精确到秒"
+  default_prompt: "Use $record-changes to record a change or Q&A for this project"

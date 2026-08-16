@@ -1,0 +1,39 @@
+node_modules
+dist
+out
+release
+*.local
+.DS_Store
+.idea
+*.log
+.dsh-dev
+.pnpm-store
+.vscode
+docs
+resources/dsh-host
+
+
+# Playwright / 测试产物
+test-results/
+playwright-report/
+blob-report/
+coverage/
+tests/verification
+
+# 环境变量 / 密钥（保留 .env.example）
+.env
+.env.*
+!.env.example
+electron-builder.env
+
+# 类型增量缓存 / 临时验证目录
+*.tsbuildinfo
+.tmp-*
+.eslintcache
+
+# agent 运行时目录
+.claude
+.codex
+.agents
+.codegraph
+
