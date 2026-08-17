@@ -1,4 +1,4 @@
-node_modules
+node_modules/
 dist
 out
 release
@@ -7,10 +7,12 @@ release
 .idea
 *.log
 .dsh-dev
-.pnpm-store
+.pnpm-store/
 .vscode
 docs
-resources/dsh-host
+resources/dsh-host/
+.npm-cache/
+resources/
 
 
 # Playwright / 测试产物

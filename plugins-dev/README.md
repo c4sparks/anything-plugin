@@ -6,17 +6,20 @@
 ## 目录结构
 
 ```
-plugins-dev/<id>/            # 独立 npm 包（自带 package.json + node_modules + 构建配置）
-  src/entry.js               # 插件源码（npm 依赖随意用，如 codemirror）
-  package.json               # 插件自身依赖与构建脚本
+plugins-dev/<id>/            # 独立插件包（自带 package.json + node_modules + 构建配置）
+  src/entry.ts               # 插件源码（TS/JS 均可；npm 依赖随意用，如 codemirror）
+  package.json               # 插件自身依赖与构建脚本（pnpm build → dist/）
+  scripts/                   # 插件包自足构建脚本（可选；第三方复制即可独立构建）
   manifest.json              # 插件 manifest（构建时复制到产物目录）
-  → 构建 → resources/plugins/<id>/   # manifest + entry.js（单文件 ESM，≤2MB）
+  → pnpm build → dist/       # 插件包自足构建产物：entry.js + manifest.json（单文件 ESM，≤2MB）
 ```
 
 ## 规则
 
 - 壳子代码 `src/` 与插件源码互不引用：插件源码按独立 npm 包自管理依赖（`plugins-dev/<id>` 内独立 `pnpm install`）。
-- 构建脚本（`scripts/build-plugin.mjs`，M2）在插件源码目录内执行，产物为单文件 ESM，写入 `resources/plugins/<id>/entry.js`。命令：`pnpm build:plugin <id>`（一次性）、`pnpm build:plugin:watch <id>`（watch 模式，改源码/manifest 自动重建）。
+- 两条构建路径：
+  - **插件包自足构建**：`cd plugins-dev/<id> && pnpm build` → `dist/`（插件包自带构建脚本与依赖，第三方复制即可独立构建，不依赖框架）。
+  - **框架侧 dev 便利**：`pnpm build:plugin <id>`（一次性）、`pnpm build:plugin:watch <id>`（watch 模式，改源码/manifest 自动重建）把 `plugins-dev/<id>` 源码直接构建进 `resources/plugins/<id>/` 供壳子 dev 加载。入口支持 `src/entry.ts|.mts|.js`，产物为单文件 ESM（≤2MB、无裸导入）。
 - 打包排除：`plugins-dev/**` 不进安装包/asar（electron-builder files 已排除）。
 - 插件源码应纳入版本控制；插件自身 node_modules 由全局 `node_modules` 规则忽略。
 - 卸载/升级语义：壳子只认 `resources/plugins/<id>/`（或 prod `userData/plugins/<id>/`），与源码目录无关。
@@ -30,4 +33,4 @@ plugins-dev/<id>/            # 独立 npm 包（自带 package.json + node_modul
 ## 现状
 
 - 手写单文件外部插件（demo-status）：源码即产物，仍放 `resources/plugins/`。
-- 打包型插件（如笔记知识库 notes，设计态）：源码进 `plugins-dev/notes/`，M2 构建脚本落地后可用。
+- 独立插件包（如笔记知识库 notes）：源码在 `plugins-dev/notes/`，自带 `scripts/build.mjs` 构建到 `dist/`；框架侧 `pnpm build:plugin notes` 可构建进 `resources/plugins/notes/` 供 dev 试玩。

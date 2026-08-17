@@ -1,0 +1,15 @@
+{
+  "name": "notes-plugin-js",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@codemirror/lang-markdown": "^6.3.2",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/state": "^6.5.2",
+    "@codemirror/view": "^6.43.8",
+    "codemirror": "^6.0.1",
+    "dompurify": "^3.4.13",
+    "marked": "^18.0.9"
+  }
+}

@@ -9,7 +9,7 @@ import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 
-const PLUGIN_ID = 'notes'
+const PLUGIN_ID = 'notes_js'
 const ROOT = ''
 /** 侧栏折叠为窄条时的宽度（= 折叠/展开按钮宽度） */
 const SIDE_COLLAPSED = 36
@@ -2199,6 +2199,6 @@ const ICON_FOLDER_SM = '<svg viewBox="0 0 24 24" width="14" height="14" fill="no
 const ICON_DOC_SM = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>'
 const ICON_PLUS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>'
 
-customElements.define('app-plugin-notes', NotesApp)
+customElements.define('app-plugin-notes-js', NotesApp)
 
 

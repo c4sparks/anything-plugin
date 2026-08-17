@@ -1,0 +1,12 @@
+{
+  "id": "notes_js",
+  "name": "笔记",
+  "kind": "webComponent",
+  "tag": "app-plugin-notes-js",
+  "slot": "content",
+  "order": 30,
+  "entry": "entry.js",
+  "version": "0.1.0",
+  "description": "个人知识库：Markdown 笔记 + 文件管理 + 搜索",
+  "publisher": "AnythingPlugin"
+}

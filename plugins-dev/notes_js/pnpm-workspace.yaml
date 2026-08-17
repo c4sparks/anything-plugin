@@ -1,0 +1,2 @@
+# 标记本目录为独立 pnpm 工程（防止向上命中根 workspace）。
+# 本包依赖（codemirror/marked/dompurify）无构建脚本，无需 allowBuilds。
