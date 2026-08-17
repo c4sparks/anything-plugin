@@ -181,7 +181,7 @@ function closeWindow(): void {
         </div>
       </aside>
 
-      <main class="content">
+      <main class="content" :class="{ 'plugin-view': store.currentView.type === 'plugin' }">
         <ContentHost :pages="pages" />
       </main>
     </div>
@@ -409,6 +409,12 @@ function closeWindow(): void {
   flex: 1;
   padding: var(--space-4);
   overflow: auto;
+}
+
+/* 插件视图：内容区零边距、由插件自身撑满并管理滚动（如笔记插件） */
+.content.plugin-view {
+  padding: 0;
+  overflow: hidden;
 }
 
 /* ---- 状态栏 ---- */

@@ -2,8 +2,8 @@
 // 打包型外部插件：源码可 import npm 依赖（CodeMirror 6），由 scripts/build-plugin.mjs 打包为单文件 ESM。
 // 数据：window.api.pluginFiles（契约 docs/插件契约.md §6），存 userData/plugin-data/notes/files/。
 import { EditorView, basicSetup } from 'codemirror'
-import { EditorState, Compartment } from '@codemirror/state'
-import { Decoration, ViewPlugin, WidgetType } from '@codemirror/view'
+import { EditorState, Compartment, Annotation } from '@codemirror/state'
+import { Decoration, ViewPlugin, WidgetType, placeholder } from '@codemirror/view'
 import { syntaxTree } from '@codemirror/language'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { marked } from 'marked'
@@ -11,20 +11,36 @@ import DOMPurify from 'dompurify'
 
 const PLUGIN_ID = 'notes'
 const ROOT = ''
+/** 侧栏折叠为窄条时的宽度（= 折叠/展开按钮宽度） */
+const SIDE_COLLAPSED = 36
+/** 分屏同文件多份时的内容同步标记：带此 annotation 的改动来自其他面板，不再转发/落盘 */
+const Sync = Annotation.define()
+
+/** 分屏树工具：摘除含 cardId 的叶子并就地折叠（split 只剩 1 孩子 → 用孩子替换自己） */
+function removeLeaf(node, cardId) {
+  if (!node) return null
+  if (node.type === 'leaf') return node.cardId === cardId ? null : node
+  const a = removeLeaf(node.children[0], cardId)
+  const b = removeLeaf(node.children[1], cardId)
+  if (a === null && b === null) return null
+  if (a === null) return b
+  if (b === null) return a
+  return { type: 'split', dir: node.dir, children: [a, b] }
+}
 
 const editorTheme = EditorView.theme(
   {
-    '&': { height: '100%', backgroundColor: 'var(--surface)', color: 'var(--text)' },
-    '.cm-scroller': { fontFamily: 'var(--font-mono)', fontSize: 'var(--font-size-sm)', lineHeight: '1.6' },
-    '.cm-content': { caretColor: 'var(--accent)', padding: 'var(--space-4) 0' },
-    '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--accent)' },
+    '&': { height: '100%', backgroundColor: 'var(--surface)', color: 'var(--text)', fontSize: '14px' },
+    '.cm-scroller': { lineHeight: '1.7', scrollBehavior: 'smooth' },
+    '.cm-content': { caretColor: 'var(--accent)', padding: '0', maxWidth: '800px', margin: '0 auto', fontFamily: 'var(--font-ui)', fontSize: '14px' },
+    '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--accent)', borderLeftWidth: '2px' },
     '.cm-activeLine': { backgroundColor: 'var(--surface-2)' },
     '.cm-activeLineGutter': { backgroundColor: 'var(--surface-2)' },
     '.cm-gutters': { backgroundColor: 'var(--surface)', color: 'var(--text-muted)', borderRight: '1px solid var(--border)' },
     '.cm-lineNumbers .cm-gutterElement': { color: 'var(--text-muted)' },
     '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection': { backgroundColor: 'var(--focus-ring)' },
     '.cm-matchingBracket': { backgroundColor: 'var(--surface-2)', outline: '1px solid var(--border-strong)' },
-    '.cm-placeholder': { color: 'var(--text-muted)' },
+    '.cm-placeholder': { color: 'var(--text-muted)', fontStyle: 'italic' },
   },
   { dark: false },
 )
@@ -41,6 +57,29 @@ class TableSepWidget extends WidgetType {
   }
   ignoreEvent() {
     return false
+  }
+}
+
+// 任务列表 `[ ]` / `[x]` → 可点击复选框 widget（点击切换完成态，记录原文范围）
+class TaskBoxWidget extends WidgetType {
+  constructor(done, from, to) {
+    super()
+    this.done = done
+    this.from = from
+    this.to = to
+  }
+  toDOM() {
+    const s = document.createElement('span')
+    s.className = 'cm-task-box' + (this.done ? ' done' : '')
+    s.dataset.from = this.from
+    s.dataset.to = this.to
+    return s
+  }
+  eq(o) {
+    return o instanceof TaskBoxWidget && o.done === this.done && o.from === this.from && o.to === this.to
+  }
+  ignoreEvent() {
+    return true
   }
 }
 
@@ -205,7 +244,7 @@ const livePreviewExt = () =>
               while (cur) {
                 if (cur.name === 'TaskMarker') {
                   done = state.sliceDoc(cur.from, cur.to).includes('x')
-                  hideMarker(cur.from, cur.to, n.to)
+                  decos.push(Decoration.replace({ widget: new TaskBoxWidget(done, cur.from, cur.to) }).range(cur.from, cur.to))
                 }
                 cur = cur.nextSibling
               }
@@ -328,20 +367,21 @@ class NotesApp extends HTMLElement {
     this.expanded = new Set()
     this.selectedFolder = ROOT // 新文件/夹落点
     this.selectedItem = null // 树中选中项（文件/夹 path）
-    this.current = null // 当前编辑笔记 path
-    this.editor = null
-    this.saveTimer = null
+    // 多开面板模型：panes = 所有打开的笔记（标签）；分屏按「卡片」分组，每张卡片自带独立标签栏
+    this.panes = new Map() // paneId -> { id, cardId, path, editor, saveTimer, liveCompartment, live }
+    this.cards = new Map() // cardId -> { id, paneIds:[], activePaneId }
+    this.splitRoot = null // null=单卡片 | {type:'split',dir,children:[leaf,leaf]}（叶子为 cardId）
+    this.activePaneId = null // 当前激活标签
+    this.activeCardId = null // 当前聚焦卡片
+    this.lastActivePaneId = null
+    this.nextPaneId = 1
+    this.nextCardId = 1
     this.filter = ''
     this.sortKey = 'name'
     this.sortDir = 1
     this.sideCollapsed = false
     this.sideWidth = 260
-    this.viewMode = 'normal' // normal(实时预览) | source(源码) | preview | split | split-v
-    this.live = true // 编辑器是否处于所见即所得（普通模式）
-    this.liveCompartment = null
-    this.editorB = null // 分屏 B 面板编辑器（源码视图）
-    this.paneBPath = null
-    this.paneBSaveTimer = null
+    this.morePaneId = null // 更多菜单当前作用的面板 id
     this.navOpen = false // 导航面板默认隐藏，点「更多 → 导航」显示/关闭
     this.navQuery = ''
     this.outline = [] // [{el, level, text}]
@@ -350,25 +390,35 @@ class NotesApp extends HTMLElement {
     this.dialog = null // {title, mode:'input'|'folder'|'confirm', resolve, message?}
   }
 
+  get activePane() {
+    return this.activePaneId ? this.panes.get(this.activePaneId) ?? null : null
+  }
+
+  /** 激活面板的笔记路径（向后兼容旧 `this.current` 读法；ESM strict 下不可赋值，所有赋值点已改写） */
+  get current() {
+    return this.activePane?.path ?? null
+  }
+
   connectedCallback() {
     this.attachShadow({ mode: 'open' })
     this.renderShell()
     this.bind()
+    this.renderSplit() // 初始无面板：显示全局占位
+    this.updateHead()
     void this.loadDir(ROOT)
   }
 
   disconnectedCallback() {
-    clearTimeout(this.saveTimer)
     clearTimeout(this.previewTimer)
-    clearTimeout(this.paneBSaveTimer)
-    if (this.current) void this.saveCurrent()
-    if (this.paneBPath && this.editorB) {
-      window.api.pluginFiles.write(PLUGIN_ID, this.paneBPath, this.editorB.state.doc.toString()).catch(() => {})
+    for (const rec of this.panes.values()) {
+      clearTimeout(rec.saveTimer)
+      if (rec.path && rec.editor) {
+        const content = rec.editor.state.doc.toString() // 先捕获内容再写（fire-and-forget）
+        window.api.pluginFiles.write(PLUGIN_ID, rec.path, content).catch(() => {})
+      }
+      rec.editor?.destroy()
     }
-    this.editor?.destroy()
-    this.editorB?.destroy()
-    this.editor = null
-    this.editorB = null
+    this.panes.clear()
   }
 
   // ---------- 渲染 ----------
@@ -389,6 +439,13 @@ class NotesApp extends HTMLElement {
           overflow: hidden;
         }
         .side { width: 260px; flex: none; display: flex; flex-direction: column; border-right: 1px solid var(--border, #d9dce2); background: var(--surface-2, #eceef1); }
+        /* 折叠为窄条：只留折叠/展开按钮 */
+        .side.collapsed { width: 30px !important; }
+        /* 书本图标整体隐藏/显示侧边栏 */
+        .side.hidden { display: none; }
+        .side.collapsed .toolbar { flex-direction: column; gap: 2px; justify-content: flex-start; }
+        .side.collapsed .toolbar .icon-btn:not([data-act="toggle-side"]) { display: none; }
+        .side.collapsed .tree { display: none; }
         .splitter { flex: none; width: 5px; cursor: col-resize; background: transparent; transition: background var(--duration-fast, 120ms) ease; }
         .splitter:hover, .splitter.dragging { background: var(--accent, #0e7c6b); opacity: .55; }
         .toolbar { display: flex; align-items: center; gap: var(--space-1, 4px); padding: 4px; border-bottom: 1px solid var(--border, #d9dce2); flex-wrap: wrap; }
@@ -435,47 +492,129 @@ class NotesApp extends HTMLElement {
         .t-row.cur { color: var(--accent, #0e7c6b); font-weight: var(--font-weight-medium, 500); }
         .t-empty { padding: var(--space-3, 12px); font-size: var(--font-size-sm, 13px); color: var(--text-muted, #5b6370); }
         .editor { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-        .editor-head {
-          display: flex; align-items: center; gap: var(--space-2, 8px);
-          padding: 4px 8px;
+        /* 顶部标签栏：多标签（每个打开的笔记一个标签），激活标签白底与下方内容连通 */
+        .tabs-bar {
+          display: flex; align-items: stretch; flex: none;
+          /* 白底：消除标签与 + 之间露出的灰色空隙（tabs-bar 底色） */
+          background: var(--surface, #fff);
           border-bottom: 1px solid var(--border, #d9dce2);
-          font-size: var(--font-size-sm, 13px); color: var(--text-muted, #5b6370); min-height: 34px;
+          min-height: 36px;
         }
-        .editor-head .note-name { font-size: var(--font-size-base, 14px); font-weight: var(--font-weight-semibold, 600); color: var(--text, #1a1d23); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .head-actions { display: none; align-items: center; gap: var(--space-1, 4px); }
-        .head-actions.show { display: inline-flex; }
-        .head-actions .icon-btn { width: 28px; height: 28px; }
-        .head-actions .icon-btn.on { color: var(--accent, #0e7c6b); background: var(--surface-2, #eceef1); }
+        .tabs { display: flex; align-items: flex-end; flex: 1; min-width: 0; gap: 2px; padding: 4px 4px 0; overflow-x: auto; }
+        .tabs::-webkit-scrollbar { height: 4px; }
+        .tab {
+          flex: none; min-width: 72px; max-width: 200px; height: 30px;
+          display: inline-flex; align-items: center; gap: 4px;
+          padding: 0 12px;
+          border: 1px solid var(--border, #d9dce2); border-bottom: none;
+          border-radius: var(--radius-base, 6px) var(--radius-base, 6px) 0 0;
+          background: var(--surface-2, #eceef1);
+          color: var(--text-muted, #5b6370);
+          font-size: var(--font-size-sm, 13px);
+          cursor: pointer; user-select: none;
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .tab:hover { color: var(--text, #1a1d23); }
+        .tab.active { background: var(--surface, #fff); color: var(--text, #1a1d23); font-weight: var(--font-weight-medium, 500); margin-bottom: -1px; }
+        .tab-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .tab-close {
+          flex: none; width: 16px; height: 16px; margin-left: 2px;
+          display: inline-flex; align-items: center; justify-content: center;
+          border: none; border-radius: 3px; background: transparent;
+          color: var(--text-muted, #5b6370); font-size: 13px; line-height: 1; cursor: pointer; padding: 0;
+        }
+        .tab-close:hover { background: var(--surface-2, #eceef1); color: var(--text, #1a1d23); }
+        /* 分屏中的标签：小图标标示其正在分屏（方向跟随分屏菜单） */
+        .tab-split-glyph { flex: none; display: inline-flex; width: 12px; height: 12px; color: var(--accent, #0e7c6b); }
+        .tab-split-glyph svg { width: 12px; height: 12px; }
+        .tabs-empty { align-self: center; padding: 0 12px; font-size: var(--font-size-xs, 12px); color: var(--text-muted, #5b6370); }
+        .tabs-actions { display: flex; align-items: center; gap: 2px; padding: 3px 6px; flex: none; }
+        .tabs-actions .icon-btn { width: 28px; height: 28px; }
+        /* 页面级控制栏：左=面包屑路径（我在哪），右=工具图标（我能做什么） */
+        .page-bar {
+          display: flex; align-items: center; gap: var(--space-2, 8px);
+          flex: none; min-height: 40px;
+          padding: 0 var(--space-4, 16px);
+          background: var(--surface, #fff);
+          border-bottom: 1px solid var(--border, #d9dce2);
+        }
+        .crumb { flex: 1; min-width: 0; display: flex; align-items: center; gap: 2px; font-size: var(--font-size-sm, 13px); color: var(--text-muted, #5b6370); overflow: hidden; white-space: nowrap; }
+        .crumb-item { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .crumb-item.folder { cursor: pointer; }
+        .crumb-item.folder:hover { color: var(--accent, #0e7c6b); }
+        .crumb-item.cur { color: var(--text, #1a1d23); font-weight: var(--font-weight-medium, 500); }
+        .crumb-sep { flex: none; margin: 0 2px; color: var(--border-strong, #b6bcc7); }
+        .page-actions { display: flex; align-items: center; gap: 2px; flex: none; }
+        .page-actions .icon-btn { width: 30px; height: 30px; }
         .editor-body { flex: 1; min-height: 0; display: flex; }
         .main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
         .main > * { min-width: 0; min-height: 0; }
-        .pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; }
-        .pane-head { display: flex; align-items: center; gap: var(--space-1, 4px); padding: 2px 8px; border-bottom: 1px solid var(--border, #d9dce2); font-size: 12px; color: var(--text-muted, #5b6370); min-height: 26px; flex: none; }
-        .pane-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .pane-close { width: 20px; height: 20px; border: none; border-radius: var(--radius-sm, 4px); background: transparent; color: var(--text-muted, #5b6370); cursor: pointer; font-size: 14px; line-height: 1; }
-        .pane-close:hover { background: var(--surface, #fff); color: var(--danger, #b3372e); }
-        /* 分屏：A/B 双面板，均显示源文件 */
-        .editor.mode-split .main { flex-direction: row; }
-        .editor.mode-split-v .main { flex-direction: column; }
-        .editor.mode-split .pane { border-right: 1px solid var(--border, #d9dce2); }
-        .editor.mode-split .pane:last-child { border-right: none; }
-        .editor.mode-split-v .pane-b { border-top: 1px solid var(--border, #d9dce2); }
-        .editor.mode-split .preview, .editor.mode-split-v .preview { display: none; }
-        .editor:not(.mode-split):not(.mode-split-v) .pane-b { display: none; }
-        .editor:not(.mode-split):not(.mode-split-v) [data-pane-head-a] { display: none !important; }
-        .pane.drag-over { outline: 2px dashed var(--accent, #0e7c6b); outline-offset: -2px; background: var(--surface-2, #eceef1); }
-        .editor.mode-preview .cm-wrap { display: none; }
-        .editor.mode-source .preview { display: none; }
-        .editor.mode-normal .preview { display: none; }
+        .card { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; position: relative; }
+        /* 卡片：自带标签栏 + 路径栏 + 编辑器，每个分屏面板是完整的一份 */
+        .card-tabs { display: flex; align-items: stretch; gap: 2px; padding: 4px 4px 0; background: var(--surface, #fff); border-bottom: 1px solid var(--border, #d9dce2); min-height: 34px; overflow-x: auto; }
+        .card-tabs::-webkit-scrollbar { height: 4px; }
+        .ctab {
+          flex: none; min-width: 72px; max-width: 180px; height: 28px;
+          display: inline-flex; align-items: center; gap: 4px;
+          padding: 0 10px;
+          border: 1px solid var(--border, #d9dce2); border-bottom: none;
+          border-radius: var(--radius-base, 6px) var(--radius-base, 6px) 0 0;
+          background: var(--surface-2, #eceef1);
+          color: var(--text-muted, #5b6370);
+          font-size: var(--font-size-sm, 13px);
+          cursor: pointer; user-select: none;
+        }
+        .ctab.active { background: var(--surface, #fff); color: var(--text, #1a1d23); font-weight: var(--font-weight-medium, 500); margin-bottom: -1px; }
+        .ctab-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .ctab-close { flex: none; width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; border: none; border-radius: 3px; background: transparent; color: var(--text-muted, #5b6370); font-size: 12px; line-height: 1; cursor: pointer; padding: 0; }
+        .ctab-close:hover { background: var(--surface-2, #eceef1); color: var(--danger, #b3372e); }
+        .ctab-new { flex: none; width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center; border: none; border-radius: var(--radius-sm, 4px); background: transparent; color: var(--text-muted, #5b6370); cursor: pointer; padding: 0; }
+        .ctab-new:hover { color: var(--accent, #0e7c6b); background: var(--surface-2, #eceef1); }
+        .ctab-new svg { width: 14px; height: 14px; }
+        .card-page { display: flex; align-items: center; gap: var(--space-1, 4px); padding: 2px 8px; min-height: 26px; border-bottom: 1px solid var(--border, #d9dce2); background: var(--surface, #fff); }
+        .card-crumb { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--text-muted, #5b6370); }
+        .card-more { width: 22px; height: 22px; flex: none; border: none; border-radius: var(--radius-sm, 4px); background: transparent; color: var(--text-muted, #5b6370); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; padding: 0; }
+        .card-more svg { width: 14px; height: 14px; }
+        .card-more:hover { background: var(--surface-2, #eceef1); color: var(--text, #1a1d23); }
+        .card.active { box-shadow: inset 0 2px 0 var(--accent, #0e7c6b); } /* 聚焦卡片顶边高亮 */
+        /* 多开拆分：递归 .split 容器 + .pane；布局由拆分树驱动，viewMode 不决定布局 */
+        .split { flex: 1; min-width: 0; min-height: 0; display: flex; }
+        .split[data-dir="row"] { flex-direction: row; }
+        .split[data-dir="column"] { flex-direction: column; }
+        .split > .split, .split > .card { flex: 1; min-width: 0; min-height: 0; }
+        /* 可拖拽分割线：浅紫虚线，两端各留 3px 命中区，hover 加深；顶层左右分屏的竖线贯穿标签栏/路径栏 */
+        .split-divider { flex: none; position: relative; }
+        .split[data-dir="row"] > .split-divider { width: 7px; cursor: col-resize; }
+        .split[data-dir="row"] > .split-divider::before { content: ''; position: absolute; top: 0; bottom: 0; left: 2px; width: 3px; border-left: 2px dashed #b7a3f0; }
+        .split[data-dir="column"] > .split-divider { height: 7px; cursor: row-resize; }
+        .split[data-dir="column"] > .split-divider::before { content: ''; position: absolute; left: 0; right: 0; top: 2px; height: 3px; border-top: 2px dashed #b7a3f0; }
+        .split-divider:hover::before, .split-divider.dragging::before { border-color: #8b5cf6; }
+        /* 拖拽落点提示：鼠标下方小标签（内容→插入链接），不覆盖/置灰面板 */
+        .drag-hint {
+          position: fixed; z-index: 60; display: none;
+          padding: 3px 8px; border-radius: var(--radius-sm, 4px);
+          background: var(--surface, #fff); border: 1px solid var(--border-strong, #b6bcc7);
+          box-shadow: var(--shadow-1, 0 1px 3px rgba(0,0,0,.12));
+          color: var(--accent, #0e7c6b); font-size: 12px; font-weight: var(--font-weight-semibold, 600);
+          pointer-events: none; white-space: nowrap;
+        }
+        .drag-hint.show { display: block; }
+        /* 每卡片独立显示模式：preview 时隐藏编辑器、显示渲染预览 */
+        .card .preview { display: none; }
+        .card[data-mode="preview"] .cm-wrap { display: none; }
+        .card[data-mode="preview"] .preview { display: block; }
+        /* 干净模式：普通/预览隐藏行号；源码模式保留行号并回退等宽字体 */
+        .card[data-mode="normal"] .cm-gutters, .card[data-mode="preview"] .cm-gutters { display: none; }
+        .card[data-mode="source"] .cm-content { font-family: var(--font-mono, monospace); font-size: 13px; }
         .cm-wrap { flex: 1; min-height: 0; overflow: hidden; }
-        .cm-wrap .placeholder { padding: var(--space-5, 24px); font-size: var(--font-size-sm, 13px); color: var(--text-muted, #5b6370); }
+        .main > .placeholder, .card > .placeholder, .cm-wrap .placeholder { padding: var(--space-5, 24px); font-size: var(--font-size-sm, 13px); color: var(--text-muted, #5b6370); }
         /* 普通模式（所见即所得实时预览）样式 */
-        .cm-line.cm-live-h1 { font-size: 20px; font-weight: 700; border-bottom: 1px solid var(--border, #d9dce2); line-height: 1.4; }
-        .cm-line.cm-live-h2 { font-size: 17px; font-weight: 700; line-height: 1.4; }
-        .cm-line.cm-live-h3 { font-size: 15px; font-weight: 600; line-height: 1.4; }
-        .cm-line.cm-live-h4, .cm-line.cm-live-h5, .cm-line.cm-live-h6 { font-size: 14px; font-weight: 600; }
-        .cm-line.cm-live-quote { color: var(--text-muted, #5b6370); border-left: 3px solid var(--border-strong, #b6bcc7); padding-left: var(--space-2, 8px); }
-        .cm-line.cm-live-codeblock { background: var(--surface-2, #eceef1); font-family: var(--font-mono, monospace); }
+        .cm-line.cm-live-h1 { font-size: 28px; font-weight: 700; border-bottom: 1px solid var(--border, #d9dce2); line-height: 1.35; padding: .4em 0 .25em; }
+        .cm-line.cm-live-h2 { font-size: 21px; font-weight: 700; line-height: 1.35; padding: .7em 0 .3em; }
+        .cm-line.cm-live-h3 { font-size: 17px; font-weight: 600; line-height: 1.4; padding: .5em 0 .2em; }
+        .cm-line.cm-live-h4, .cm-line.cm-live-h5, .cm-line.cm-live-h6 { font-size: 15px; font-weight: 600; padding: .3em 0 .1em; }
+        .cm-line.cm-live-quote { color: var(--text-muted, #5b6370); border-left: 3px solid var(--accent, #0e7c6b); padding: .15em 0 .15em var(--space-3, 12px); background: var(--surface-2, #eceef1); border-radius: 0 var(--radius-sm, 4px) var(--radius-sm, 4px) 0; }
+        .cm-line.cm-live-codeblock { background: var(--surface-2, #eceef1); font-family: var(--font-mono, monospace); font-size: 13px; }
         .cm-line span.cm-live-strong { font-weight: 700; }
         .cm-line span.cm-live-em { font-style: italic; }
         .cm-line span.cm-live-code { font-family: var(--font-mono, monospace); font-size: 12px; background: var(--surface-2, #eceef1); border-radius: var(--radius-sm, 4px); padding: 0 2px; }
@@ -487,11 +626,21 @@ class NotesApp extends HTMLElement {
         .cm-line.cm-live-table-head { font-weight: 600; }
         .cm-live-tbl-sep { display: inline-block; width: 8px; margin: 0 3px; border-left: 1px solid var(--border-strong, #b6bcc7); height: 1em; vertical-align: middle; }
         .cm-line.cm-live-task-done { color: var(--text-muted, #5b6370); text-decoration: line-through; }
-        .preview { flex: 1; overflow-y: auto; padding: 12px 16px; font-size: var(--font-size-sm, 13px); line-height: 1.7; color: var(--text, #1a1d23); background: var(--surface, #fff); }
+        /* 任务复选框（可点击切换完成态） */
+        .cm-task-box {
+          display: inline-flex; align-items: center; justify-content: center;
+          width: 15px; height: 15px; margin-right: 6px; vertical-align: -2px;
+          border: 1.5px solid var(--border-strong, #b6bcc7); border-radius: 4px;
+          cursor: pointer; user-select: none; flex: none;
+        }
+        .cm-task-box:hover { border-color: var(--accent, #0e7c6b); }
+        .cm-task-box.done { background: var(--accent, #0e7c6b); border-color: var(--accent, #0e7c6b); }
+        .cm-task-box.done::after { content: '✓'; color: var(--accent-text, #fff); font-size: 10px; line-height: 1; }
+        .preview { flex: 1; overflow-y: auto; padding: 24px max(16px, calc(50% - 400px)); font-size: var(--font-size-sm, 13px); line-height: 1.7; color: var(--text, #1a1d23); background: var(--surface, #fff); }
         .preview h1, .preview h2, .preview h3, .preview h4 { margin: 1em 0 .5em; line-height: 1.35; }
-        .preview h1 { font-size: 20px; border-bottom: 1px solid var(--border, #d9dce2); padding-bottom: .3em; }
-        .preview h2 { font-size: 17px; }
-        .preview h3 { font-size: 15px; }
+        .preview h1 { font-size: 28px; border-bottom: 1px solid var(--border, #d9dce2); padding-bottom: .3em; }
+        .preview h2 { font-size: 21px; }
+        .preview h3 { font-size: 17px; }
         .preview p { margin: .6em 0; }
         .preview ul, .preview ol { margin: .6em 0; padding-left: 1.6em; }
         .preview blockquote { margin: .6em 0; padding: .2em 1em; border-left: 3px solid var(--accent, #0e7c6b); color: var(--text-muted, #5b6370); background: var(--surface-2, #eceef1); border-radius: var(--radius-sm, 4px); }
@@ -557,38 +706,14 @@ class NotesApp extends HTMLElement {
             <button class="icon-btn" data-act="new-folder" title="新增文件夹" aria-label="新增文件夹">${ICON_FOLDER}</button>
             <button class="icon-btn" data-act="sort" title="排序" aria-label="排序">${ICON_SORT}</button>
             <button class="icon-btn" data-act="expand" title="展开/收起" aria-label="展开收起">${ICON_EXPAND}</button>
+            <button type="button" class="icon-btn" data-act="toggle-side" title="折叠左侧" aria-label="折叠左侧">${ICON_PANEL_LEFT}</button>
           </div>
           <div class="tree" data-tree></div>
         </aside>
         <div class="splitter" data-splitter title="拖动调整宽度"></div>
-        <section class="editor mode-normal">
-          <div class="editor-head">
-            <span class="note-name" data-note-title>选择一篇笔记</span>
-            <button type="button" class="icon-btn" data-act="toggle-side" title="折叠左侧" aria-label="折叠左侧">${ICON_PANEL_LEFT}</button>
-            <div class="head-actions" data-head-actions>
-              <button type="button" class="icon-btn" data-act="preview" title="预览" aria-label="预览">${ICON_EYE}</button>
-              <button type="button" class="icon-btn" data-act="more" title="更多" aria-label="更多">${ICON_MORE}</button>
-            </div>
-          </div>
+        <section class="editor">
           <div class="editor-body">
-            <div class="main">
-              <div class="pane pane-a" data-pane-a>
-                <div class="pane-head" data-pane-head-a hidden>
-                  <span class="pane-title" data-pane-title-a></span>
-                </div>
-                <div class="cm-wrap" data-editor><div class="placeholder">选择或新建一篇笔记开始。</div></div>
-                <div class="preview" data-preview></div>
-              </div>
-              <div class="pane pane-b" data-pane-b>
-                <div class="pane-head" data-pane-head-b>
-                  <span class="pane-title" data-pane-title-b>分屏</span>
-                  <button type="button" class="pane-close" data-pane-close-b title="关闭分屏" aria-label="关闭分屏">×</button>
-                </div>
-                <div class="cm-wrap" data-editor-b>
-                  <div class="placeholder">拖入笔记到此处打开。</div>
-                </div>
-              </div>
-            </div>
+            <div class="main" data-split-root></div>
             <div class="nav-pane hidden" data-nav>
               <div class="nav-toolbar">
                 <div class="search-wrap">
@@ -604,6 +729,7 @@ class NotesApp extends HTMLElement {
         </section>
         <div class="menu" data-sort-menu></div>
         <div class="menu" data-more-menu style="min-width:150px"></div>
+        <div class="drag-hint" data-drag-hint></div>
         <div class="ctx" data-ctx></div>
         <div class="overlay" data-overlay>
           <div class="modal">
@@ -629,8 +755,6 @@ class NotesApp extends HTMLElement {
     root.querySelector('[data-act="sort"]').addEventListener('click', (e) => this.toggleSortMenu(e))
     root.querySelector('[data-act="expand"]').addEventListener('click', () => this.toggleExpandAll())
     root.querySelector('[data-act="toggle-side"]').addEventListener('click', () => this.toggleSide())
-    root.querySelector('[data-act="preview"]').addEventListener('click', () => this.togglePreview())
-    root.querySelector('[data-act="more"]').addEventListener('click', (e) => this.toggleMoreMenu(e))
     root.querySelector('[data-nav-search]').addEventListener('input', (e) => {
       const v = e.target.value.trim().toLowerCase()
       this.navQuery = v
@@ -657,56 +781,96 @@ class NotesApp extends HTMLElement {
       if (!item) return
       const act = item.dataset.moreAct
       this.hideMoreMenu()
-      this.moreAction(act)
+      this.moreAction(act, this.morePaneId)
     })
     root.querySelector('[data-splitter]').addEventListener('mousedown', (e) => this.startSplitDrag(e))
-    root.querySelector('[data-pane-close-b]').addEventListener('click', () => {
-      this.closePaneB()
-      this.setViewMode('normal')
-    })
-    root.querySelector('[data-pane-b]').addEventListener('dragover', (e) => {
-      e.preventDefault()
-      root.querySelector('[data-pane-b]').classList.add('drag-over')
-    })
-    root.querySelector('[data-pane-b]').addEventListener('dragleave', (e) => {
-      if (!e.currentTarget.contains(e.relatedTarget)) root.querySelector('[data-pane-b]').classList.remove('drag-over')
-    })
-    root.querySelector('[data-pane-b]').addEventListener('drop', (e) => {
-      e.preventDefault()
-      root.querySelector('[data-pane-b]').classList.remove('drag-over')
-      const path = e.dataTransfer.getData('text/plain')
-      if (path && this.isSplitMode(this.viewMode)) void this.openPaneB(path)
-    })
-    root.querySelector('[data-pane-a]').addEventListener('dragover', (e) => {
-      e.preventDefault()
-      root.querySelector('[data-pane-a]').classList.add('drag-over')
-    })
-    root.querySelector('[data-pane-a]').addEventListener('dragleave', (e) => {
-      if (!e.currentTarget.contains(e.relatedTarget)) root.querySelector('[data-pane-a]').classList.remove('drag-over')
-    })
-    root.querySelector('[data-pane-a]').addEventListener('drop', (e) => {
-      e.preventDefault()
-      root.querySelector('[data-pane-a]').classList.remove('drag-over')
-      const path = e.dataTransfer.getData('text/plain')
-      if (!path) return
-      const rect = e.currentTarget.getBoundingClientRect()
-      const x = e.clientX - rect.left
-      const y = e.clientY - rect.top
-      if (!this.isSplitMode(this.viewMode)) {
-        // 单面板：拖到右半 → 左右分屏(B)；下半 → 上下分屏(B)；左/上半 → 打开到 A
-        if (x >= rect.width / 2) {
-          this.setViewMode('split')
-          void this.openPaneB(path)
-        } else if (y >= rect.height / 2) {
-          this.setViewMode('split-v')
-          void this.openPaneB(path)
-        } else {
-          void this.openNote(path)
+    const splitRoot = root.querySelector('[data-split-root]')
+    // 卡片内事件委托：标签切换/关闭、新建、更多、点击聚焦、拖拽（标签栏=多开，内容=插链接）
+    splitRoot.addEventListener('click', (e) => {
+      const card = e.target.closest('[data-card-id]')
+      if (!card) return
+      const cardId = card.dataset.cardId
+      if (e.target.closest('.ctab-close')) {
+        e.stopPropagation()
+        void this.closePane(e.target.closest('.ctab-close').dataset.cardTabClose)
+        return
+      }
+      if (e.target.closest('.ctab-new')) {
+        void this.newNoteFromPane(this.cards.get(cardId)?.activePaneId)
+        return
+      }
+      const tab = e.target.closest('[data-card-tab]')
+      if (tab) {
+        this.activatePane(tab.dataset.cardTab) // 点标签只切换，不关闭
+        return
+      }
+      if (e.target.closest('.card-more')) {
+        const paneId = this.cards.get(cardId)?.activePaneId
+        if (paneId) {
+          this.activeCardId = cardId // 聚焦该卡片，分屏/模式作用到它
+          this.morePaneId = paneId
+          this.toggleMoreMenu(e.target.closest('.card-more'), paneId)
         }
-      } else {
-        void this.openNote(path) // 分屏中拖到 A → 打开到 A
+        return
+      }
+      const paneId = this.cards.get(cardId)?.activePaneId
+      if (paneId) this.activatePane(paneId) // 点卡片其它区域 → 聚焦该卡片激活标签
+    })
+    splitRoot.addEventListener('focusin', (e) => {
+      const card = e.target.closest('[data-card-id]')
+      if (!card) return
+      const paneId = this.cards.get(card.dataset.cardId)?.activePaneId
+      if (paneId) this.activatePane(paneId)
+    })
+    splitRoot.addEventListener('mousedown', (e) => {
+      const divider = e.target.closest('.split-divider')
+      if (!divider) return
+      e.preventDefault()
+      this.startDividerDrag(e, divider)
+    })
+    // capture：抢在 CodeMirror 自身的 drop/dragover 之前处理，避免编辑器把路径当文本插入
+    splitRoot.addEventListener('dragover', (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      e.dataTransfer.dropEffect = 'copy'
+      const card = e.target.closest('[data-card-id]')
+      const hint = this.shadowRoot.querySelector('[data-drag-hint]')
+      if (card && hint) {
+        hint.textContent = e.target.closest('.card-tabs, .card-page') ? '打开为新标签' : '插入链接'
+        hint.style.left = e.clientX + 10 + 'px'
+        hint.style.top = e.clientY + 16 + 'px'
+        hint.classList.add('show')
+      }
+    }, { capture: true })
+    splitRoot.addEventListener('dragleave', (e) => {
+      const card = e.target.closest('[data-card-id]')
+      if (card && !card.contains(e.relatedTarget)) {
+        const hint = this.shadowRoot.querySelector('[data-drag-hint]')
+        if (hint) hint.classList.remove('show')
       }
     })
+    splitRoot.addEventListener('drop', (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      const path = e.dataTransfer.getData('text/plain')
+      const hint = this.shadowRoot.querySelector('[data-drag-hint]')
+      if (hint) hint.classList.remove('show')
+      if (!path) return
+      const card = e.target.closest('[data-card-id]')
+      if (!card) {
+        void this.openNote(path) // 空容器 → 打开到激活卡片
+        return
+      }
+      const cardId = card.dataset.cardId
+      const paneId = this.cards.get(cardId)?.activePaneId
+      if (e.target.closest('.card-tabs, .card-page')) {
+        // 拖到卡片标签栏/路径栏 → 在该卡片多开（插到激活标签后面）
+        void this.openAsTab(path, paneId)
+        return
+      }
+      // 内容区 → 按落点插入链接（空标签退化为打开）
+      if (paneId) void this.insertLinkAt(paneId, path, e.clientX, e.clientY)
+    }, { capture: true })
     root.querySelector('[data-tree]').addEventListener('dragstart', (e) => {
       const row = e.target.closest('[data-path]')
       if (!row || row.dataset.kind !== 'file') return
@@ -765,7 +929,7 @@ class NotesApp extends HTMLElement {
     })
     root.addEventListener('click', (e) => {
       if (!e.target.closest('[data-sort-menu]') && !e.target.closest('[data-act="sort"]')) this.hideSortMenu()
-      if (!e.target.closest('[data-more-menu]') && !e.target.closest('[data-act="more"]')) this.hideMoreMenu()
+      if (!e.target.closest('[data-more-menu]') && !e.target.closest('[data-head-act="more"]') && !e.target.closest('.card-more')) this.hideMoreMenu()
       if (!e.target.closest('[data-ctx]')) this.hideContext()
     })
     root.addEventListener('contextmenu', (e) => {
@@ -777,7 +941,8 @@ class NotesApp extends HTMLElement {
   async loadDir(dir) {
     try {
       const entries = await window.api.pluginFiles.list(PLUGIN_ID, dir === ROOT ? undefined : dir)
-      this.tree.set(dir, entries)
+      // 防御：主进程契约返回正斜杠路径，这里再归一化一次，避免 Windows 反斜杠破坏 `/` 路径逻辑
+      this.tree.set(dir, entries.map((x) => ({ ...x, path: x.path.replace(/\\/g, '/') })))
       this.renderTree()
     } catch (err) {
       console.error('[notes] loadDir', dir, err)
@@ -904,12 +1069,19 @@ class NotesApp extends HTMLElement {
     const side = this.shadowRoot.querySelector('.side')
     const btn = this.shadowRoot.querySelector('[data-act="toggle-side"]')
     const splitter = this.shadowRoot.querySelector('[data-splitter]')
-    side.style.display = this.sideCollapsed ? 'none' : ''
-    splitter.style.display = this.sideCollapsed ? 'none' : ''
-    btn.innerHTML = this.sideCollapsed ? ICON_PANEL_RIGHT : ICON_PANEL_LEFT
-    btn.title = this.sideCollapsed ? '展开左侧' : '折叠左侧'
+    if (this.sideCollapsed) {
+      side.classList.add('collapsed') // 折叠为窄条（只留按钮），非 display:none
+      splitter.style.display = 'none'
+      btn.innerHTML = ICON_PANEL_RIGHT
+      btn.title = '展开左侧'
+    } else {
+      side.classList.remove('collapsed')
+      splitter.style.display = ''
+      btn.innerHTML = ICON_PANEL_LEFT
+      btn.title = '折叠左侧'
+      this.renderTree()
+    }
     btn.setAttribute('aria-label', btn.title)
-    if (!this.sideCollapsed) this.renderTree()
   }
 
   startSplitDrag(e) {
@@ -920,7 +1092,9 @@ class NotesApp extends HTMLElement {
     splitter.classList.add('dragging')
     document.body.style.userSelect = 'none'
     const onMove = (ev) => {
-      const width = Math.min(Math.max(ev.clientX - appRect.left, 150), Math.round(appRect.width * 0.6))
+      // 最小宽度 = 折叠按钮窄条宽度（30px），再左拖即贴到最窄
+      // 侧栏宽度自适应：上限整宽 40% 且 ≤400px，保证笔记页面始终有足够显示空间
+      const width = Math.min(Math.max(ev.clientX - appRect.left, SIDE_COLLAPSED), Math.round(appRect.width * 0.4), 400)
       side.style.width = width + 'px'
       this.sideWidth = width
     }
@@ -934,52 +1108,101 @@ class NotesApp extends HTMLElement {
     window.addEventListener('mouseup', onUp)
   }
 
-  togglePreview() {
-    this.setViewMode(this.viewMode === 'preview' ? 'normal' : 'preview')
-  }
-
-  setViewMode(mode) {
-    // 退出分屏时关闭 B 面板
-    if (this.isSplitMode(this.viewMode) && !this.isSplitMode(mode)) this.closePaneB()
-    this.viewMode = mode
-    const editor = this.shadowRoot.querySelector('.editor')
-    editor.classList.remove('mode-normal', 'mode-source', 'mode-preview', 'mode-split', 'mode-split-v')
-    editor.classList.add('mode-' + mode)
-    // 普通模式 = 所见即所得实时预览；源文件/分屏 = 原文显示语法
-    const live = mode === 'normal'
-    if (this.editor && this.liveCompartment && live !== this.live) {
-      this.live = live
-      this.editor.dispatch({ effects: this.liveCompartment.reconfigure(live ? livePreviewExt() : []) })
-    } else {
-      this.live = live
+  /** 设置面板显示模式（normal 实时预览 / source 源码 / preview 渲染预览），各面板独立 */
+  setPaneMode(paneId, mode) {
+    const rec = this.panes.get(paneId)
+    if (!rec) return
+    if (rec.mode === mode) {
+      this.renderMoreMenu(paneId)
+      return
     }
-    const previewBtn = this.shadowRoot.querySelector('[data-act="preview"]')
-    previewBtn.classList.toggle('on', mode === 'preview')
-    if (mode === 'preview') this.renderPreview()
-    if (this.isSplitMode(mode)) this.updatePaneB()
+    rec.mode = mode
+    const cardEl = this.shadowRoot.querySelector(`[data-card-id="${rec.cardId}"]`)
+    if (cardEl) cardEl.dataset.mode = mode
+    if (rec.editor && rec.liveCompartment) {
+      rec.live = mode === 'normal'
+      rec.editor.dispatch({ effects: rec.liveCompartment.reconfigure(rec.live ? livePreviewExt() : []) })
+    }
+    if (mode === 'preview') this.renderPreview(paneId)
+    this.updateHead()
+    this.renderMoreMenu(paneId)
+    rec.editor?.focus()
+  }
+
+  /** 分屏：把当前卡片在当前笔记处一分为二（并排/上下）。左卡片保留原全部标签，右卡片只有当前笔记一个标签 */
+  async splitActive(dir) {
+    const card = this.ensureCard()
+    const active = this.panes.get(card.activePaneId)
+    if (!active) return
+    const newCard = this.createCard() // 右/下卡片：只含当前笔记
+    const dup = this.addTab(newCard.id)
+    dup.mode = active.mode
+    const splitNode = { type: 'split', dir, children: [{ type: 'leaf', cardId: card.id }, { type: 'leaf', cardId: newCard.id }] }
+    if (this.splitRoot) this.replaceLeaf(card.id, splitNode)
+    else this.splitRoot = splitNode
+    this.activeCardId = newCard.id
+    this.activePaneId = dup.id
+    this.updateHead()
+    this.renderSplit()
+    if (active.path) await this.openInPane(dup.id, active.path)
     this.renderMoreMenu()
-    if (mode === 'normal' || mode === 'source') this.editor?.focus()
   }
 
-  isSplitMode(mode) {
-    return mode === 'split' || mode === 'split-v'
+  /** 分屏树工具：把含 cardId 的叶子替换为 newNode（递归） */
+  replaceLeaf(cardId, newNode) {
+    const replace = (node) => {
+      if (node.type === 'leaf') return node.cardId === cardId ? newNode : node
+      const a = replace(node.children[0])
+      const b = replace(node.children[1])
+      if (a !== node.children[0] || b !== node.children[1]) node.children = [a, b]
+      return node
+    }
+    this.splitRoot = replace(this.splitRoot)
   }
 
-  toggleMoreMenu(e) {
+  /** 分屏分割线拖动：调整该 split 层级两侧面板的大小（左右/上下） */
+  startDividerDrag(e, divider) {
+    e.preventDefault()
+    const split = divider.parentElement
+    if (!split) return
+    const dir = split.dataset.dir
+    const first = split.children[0]
+    const splitRect = split.getBoundingClientRect()
+    const min = 80
+    const max = dir === 'row' ? splitRect.width : splitRect.height
+    divider.classList.add('dragging')
+    document.body.style.userSelect = 'none'
+    const onMove = (ev) => {
+      const raw = dir === 'row' ? ev.clientX - splitRect.left : ev.clientY - splitRect.top
+      const size = Math.max(min, Math.min(raw, max - min))
+      first.style.flex = `0 0 ${size}px`
+      if (split._splitNode) split._splitNode.firstSize = size // 存到节点，重建 DOM 后保持
+    }
+    const onUp = () => {
+      divider.classList.remove('dragging')
+      document.body.style.userSelect = ''
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
+  toggleMoreMenu(anchor, paneId) {
     const menu = this.shadowRoot.querySelector('[data-more-menu]')
     if (menu.classList.contains('show')) {
       this.hideMoreMenu()
       return
     }
-    this.renderMoreMenu()
+    this.renderMoreMenu(paneId)
     const host = this.shadowRoot.querySelector('.app').getBoundingClientRect()
-    const rect = e.currentTarget.getBoundingClientRect()
+    const rect = anchor.getBoundingClientRect()
     menu.style.left = Math.max(0, rect.right - host.left - 160) + 'px'
     menu.style.top = rect.bottom - host.top + 4 + 'px'
     menu.classList.add('show')
   }
 
-  renderMoreMenu() {
+  renderMoreMenu(paneId) {
     const menu = this.shadowRoot.querySelector('[data-more-menu]')
     const items = [
       { act: 'normal', label: '普通模式', icon: ICON_EDIT },
@@ -992,22 +1215,21 @@ class NotesApp extends HTMLElement {
     menu.innerHTML = items
       .map(
         (x) =>
-          `<div class="menu-item${this.moreActive(x.act) ? ' on' : ''}" data-more-act="${x.act}">${x.icon}<span>${x.label}</span></div>`,
+          `<div class="menu-item${this.moreActive(x.act, paneId) ? ' on' : ''}" data-more-act="${x.act}">${x.icon}<span>${x.label}</span></div>`,
       )
       .join('')
   }
 
-  moreActive(act) {
+  moreActive(act, paneId) {
     if (act === 'nav') return this.navOpen
-    return this.viewMode === act
+    const pane = this.panes.get(paneId ?? this.activePaneId)
+    return pane?.mode === act
   }
 
-  moreAction(act) {
-    if (act === 'normal') return this.setViewMode('normal')
-    if (act === 'preview') return this.setViewMode(this.viewMode === 'preview' ? 'normal' : 'preview')
-    if (act === 'source') return this.setViewMode('source') // 源文件 = 显示原始 markdown 语法
-    if (act === 'split') return this.setViewMode(this.viewMode === 'split' ? 'normal' : 'split')
-    if (act === 'split-v') return this.setViewMode(this.viewMode === 'split-v' ? 'normal' : 'split-v')
+  moreAction(act, paneId) {
+    if (act === 'normal' || act === 'source' || act === 'preview') return this.setPaneMode(paneId, act)
+    if (act === 'split') return this.splitActive('row')
+    if (act === 'split-v') return this.splitActive('column')
     if (act === 'nav') return this.toggleNav()
   }
 
@@ -1022,20 +1244,29 @@ class NotesApp extends HTMLElement {
     this.renderMoreMenu()
   }
 
-  renderPreview() {
-    const preview = this.shadowRoot.querySelector('[data-preview]')
+  renderPreview(paneId) {
+    const rec = this.panes.get(paneId ?? this.activePaneId)
+    if (!rec) return
+    const card = this.cards.get(rec.cardId)
+    const target = card ? this.panes.get(card.activePaneId) : rec
+    if (!target) return
+    const preview = this.shadowRoot.querySelector(`[data-card-id="${rec.cardId}"] [data-preview]`)
     if (!preview) return
-    const content = this.editor?.state.doc.toString() ?? ''
+    const content = target.editor?.state.doc.toString() ?? ''
     const raw = content ? marked.parse(content) : ''
     const safe = content ? DOMPurify.sanitize(raw) : ''
     preview.innerHTML = safe
-    this.applyNavHighlight()
-    this.buildOutline()
+    if (target.id === this.activePaneId) {
+      this.applyNavHighlight()
+      this.buildOutline()
+    }
   }
 
   applyNavHighlight() {
     if (!this.navQuery) return
-    const preview = this.shadowRoot.querySelector('[data-preview]')
+    const rec = this.activePane
+    if (!rec) return
+    const preview = this.shadowRoot.querySelector(`[data-card-id="${rec.cardId}"] [data-preview]`)
     const walker = document.createTreeWalker(preview, NodeFilter.SHOW_TEXT)
     const targets = []
     while (walker.nextNode()) {
@@ -1065,7 +1296,9 @@ class NotesApp extends HTMLElement {
   }
 
   buildOutline() {
-    const preview = this.shadowRoot.querySelector('[data-preview]')
+    const rec = this.activePane
+    if (!rec) return
+    const preview = this.shadowRoot.querySelector(`[data-card-id="${rec.cardId}"] [data-preview]`)
     this.outline = [...preview.querySelectorAll('h1,h2,h3,h4,h5,h6')].map((el) => ({
       el,
       level: Number(el.tagName[1]),
@@ -1142,49 +1375,395 @@ class NotesApp extends HTMLElement {
     }
   }
 
-  // ---------- 打开/编辑 ----------
-  async openNote(path) {
-    if (this.current === path) {
-      this.editor?.focus()
-      return
-    }
-    await this.saveCurrent()
+  /** 卡片标签栏 +：在该卡片里新建笔记（在该卡片新开一个标签） */
+  async newNoteFromPane(paneId) {
+    const rec = this.panes.get(paneId) ?? this.ensurePane()
+    if (!rec) return
+    const card = this.cards.get(rec.cardId) ?? this.ensureCard()
+    const value = await this.openInputDialog('新建笔记', '笔记标题…', '')
+    if (value == null || !value) return
+    // 目录 = 该标签笔记所在目录（无笔记则用当前选中目录）
+    const dir = rec.path && rec.path.includes('/') ? rec.path.slice(0, rec.path.lastIndexOf('/')) : rec.path ? ROOT : this.selectedFolder
+    const rel = (dir && dir !== ROOT ? dir + '/' : '') + value + '.md'
     try {
-      const content = await window.api.pluginFiles.read(PLUGIN_ID, path)
-      this.current = path
-      this.selectedItem = path
-      this.ensureEditor(content)
-      const short = path.replace(/\.md$/, '').split('/').pop()
-      this.shadowRoot.querySelector('[data-note-title]').textContent = short
-      this.shadowRoot.querySelector('[data-pane-title-a]').textContent = short
-      this.shadowRoot.querySelector('[data-head-actions]').classList.add('show')
-      this.renderTree()
-      this.renderPreview()
-      this.editor?.focus()
+      await window.api.pluginFiles.write(PLUGIN_ID, rel, `# ${value}\n`)
+      await this.loadDir(dir)
+      const tab = this.addTab(card.id) // 在该卡片新开标签
+      this.activeCardId = card.id
+      this.activePaneId = tab.id
+      this.updateHead()
+      this.renderSplit()
+      await this.openInPane(tab.id, rel)
     } catch (err) {
-      console.error('[notes] 打开失败', err)
+      console.error('[notes] 新建失败（可能已存在）', err)
     }
   }
 
-  ensureEditor(doc) {
-    const host = this.shadowRoot.querySelector('[data-editor]')
+  // ---------- 打开/编辑 ----------
+  async openNote(path) {
+    // 已打开 → 切到对应标签/卡片
+    for (const rec of this.panes.values()) {
+      if (rec.path === path) {
+        this.activatePane(rec.id)
+        return
+      }
+    }
+    // 未打开 → 在当前激活卡片里新开一个标签（旧标签全部保留）
+    const card = this.ensureCard()
+    const tab = this.addTab(card.id)
+    this.activeCardId = card.id
+    this.activePaneId = tab.id
+    this.updateHead()
+    this.renderSplit()
+    await this.openInPane(tab.id, path)
+  }
+
+  /** 多开：在 afterPaneId 所在卡片里新开一个标签（插到该页签之后）；已打开则切到其标签 */
+  async openAsTab(path, afterPaneId = null) {
+    for (const rec of this.panes.values()) {
+      if (rec.path === path) {
+        this.activatePane(rec.id)
+        return
+      }
+    }
+    const afterRec = afterPaneId ? this.panes.get(afterPaneId) : null
+    const card = afterRec ? (this.cards.get(afterRec.cardId) ?? this.ensureCard()) : this.ensureCard()
+    const tab = this.createPane()
+    tab.cardId = card.id
+    const idx = afterPaneId ? card.paneIds.indexOf(afterPaneId) : -1
+    if (idx >= 0) card.paneIds.splice(idx + 1, 0, tab.id)
+    else card.paneIds.push(tab.id)
+    card.activePaneId = tab.id
+    this.activeCardId = card.id
+    this.activePaneId = tab.id
+    this.updateHead()
+    this.renderSplit()
+    await this.openInPane(tab.id, path)
+  }
+
+  // ---------- 多开拆分面板 ----------
+  updatePaneTitle(paneId) {
+    this.renderSplit() // 卡片标签/路径随重渲染刷新（重命名/移动/换笔记时）
+  }
+
+  /** 重渲染卡片（标签栏/路径栏都在卡片内） */
+  updateHead() {
+    this.renderSplit()
+  }
+
+  /** 渲染 .main：普通态只显示激活面板（多标签堆叠）；分屏态渲染分屏树，并隐藏全局标签栏 */
+  renderSplit() {
+    const main = this.shadowRoot.querySelector('[data-split-root]')
+    if (!main) return
+    main.innerHTML = ''
+    if (this.splitRoot) {
+      main.appendChild(this.renderSplitNode(this.splitRoot))
+      return
+    }
+    const card = this.activeCard
+    if (!card || card.paneIds.length === 0) {
+      main.innerHTML = '<div class="placeholder">选择或新建一篇笔记开始。</div>'
+      return
+    }
+    main.appendChild(this.renderCard(card.id))
+  }
+
+  renderSplitNode(node) {
+    if (node.type === 'leaf') return this.renderCard(node.cardId)
+    const div = document.createElement('div')
+    div.className = 'split'
+    div.dataset.dir = node.dir
+    div._splitNode = node // 记住节点引用，拖动时回写大小比例
+    const first = this.renderSplitNode(node.children[0])
+    if (node.firstSize) first.style.flex = `0 0 ${node.firstSize}px` // 重建 DOM 后保持拖动的大小
+    div.appendChild(first)
+    const divider = document.createElement('div') // 可拖拽分割线
+    divider.className = 'split-divider'
+    div.appendChild(divider)
+    div.appendChild(this.renderSplitNode(node.children[1]))
+    return div
+  }
+
+  /** 渲染一张分屏卡片：自带标签栏（多标签+新建）+ 路径栏 + 编辑器（激活标签）+ 预览 */
+  renderCard(cardId) {
+    const card = this.cards.get(cardId)
+    const el = document.createElement('div')
+    el.className = 'card' + (cardId === this.activeCardId ? ' active' : '')
+    el.dataset.cardId = cardId
+    if (!card || card.paneIds.length === 0) {
+      el.innerHTML = '<div class="placeholder">选择或新建一篇笔记开始。</div>'
+      return el
+    }
+    const pane = this.panes.get(card.activePaneId)
+    // 卡片标签栏：该卡片打开的笔记页签 + 新建
+    const tabs = document.createElement('div')
+    tabs.className = 'card-tabs'
+    tabs.innerHTML =
+      card.paneIds
+        .map((id) => {
+          const r = this.panes.get(id)
+          const name = r?.path ? r.path.split('/').pop().replace(/\.md$/, '') : '分屏'
+          const active = id === card.activePaneId
+          return `<span class="ctab${active ? ' active' : ''}" data-card-tab="${id}" title="${this.escapeAttr(r?.path ?? '')}"><span class="ctab-name">${this.escapeHtml(name)}</span><button type="button" class="ctab-close" data-card-tab-close="${id}" title="关闭" aria-label="关闭">×</button></span>`
+        })
+        .join('') +
+      '<button type="button" class="ctab-new" data-card-new title="在该卡片新建笔记" aria-label="新建笔记">' + ICON_PLUS + '</button>'
+    el.appendChild(tabs)
+    // 卡片路径栏
+    const page = document.createElement('div')
+    page.className = 'card-page'
+    page.innerHTML = `<span class="card-crumb">${pane?.path ? this.escapeHtml(pane.path.replace(/\.md$/, '')) : ''}</span><button type="button" class="card-more" data-card-more title="更多" aria-label="更多">${ICON_MORE}</button>`
+    el.appendChild(page)
+    // 编辑器
+    const cm = document.createElement('div')
+    cm.className = 'cm-wrap'
+    cm.dataset.editor = ''
+    const holder = document.createElement('div')
+    holder.className = 'placeholder'
+    holder.textContent = pane?.path ? '' : '拖入笔记到此处打开。'
+    cm.appendChild(holder)
+    if (pane?.editor) cm.appendChild(pane.editor.dom) // 复用编辑器实例，不重建
+    el.appendChild(cm)
+    // 预览
+    const preview = document.createElement('div')
+    preview.className = 'preview'
+    preview.dataset.preview = ''
+    el.appendChild(preview)
+    return el
+  }
+
+  /** 当前分屏树里的所有卡片 id（无分屏 → 空 Set） */
+  splitCardIds() {
+    const ids = new Set()
+    if (!this.splitRoot) return ids
+    const walk = (n) => (n.type === 'leaf' ? ids.add(n.cardId) : n.children.forEach(walk))
+    walk(this.splitRoot)
+    return ids
+  }
+
+  /** 判断 paneId 所在的卡片是否在分屏树里 */
+  splitContains(paneId) {
+    const rec = this.panes.get(paneId)
+    if (!rec) return false
+    return this.splitCardIds().has(rec.cardId)
+  }
+
+  createPane() {
+    const rec = { id: 'pane-' + this.nextPaneId++, cardId: null, path: null, mode: 'normal', editor: null, saveTimer: null, liveCompartment: null, live: false }
+    this.panes.set(rec.id, rec)
+    return rec
+  }
+
+  /** 新建一张分屏卡片（含独立标签栏） */
+  createCard() {
+    const card = { id: 'card-' + this.nextCardId++, paneIds: [], activePaneId: null }
+    this.cards.set(card.id, card)
+    return card
+  }
+
+  /** 保证至少一张卡片存在且 activeCardId 有效 */
+  ensureCard() {
+    if (this.cards.size === 0) {
+      const card = this.createCard()
+      this.activeCardId = card.id
+      return card
+    }
+    if (!this.activeCardId || !this.cards.has(this.activeCardId)) {
+      this.activeCardId = [...this.cards.keys()][0]
+    }
+    return this.cards.get(this.activeCardId)
+  }
+
+  /** 在指定卡片里新增一个标签（返回新 pane），并把该卡片的激活标签设为新标签 */
+  addTab(cardId) {
+    const card = this.cards.get(cardId) ?? this.ensureCard()
+    const rec = this.createPane()
+    rec.cardId = card.id
+    card.paneIds.push(rec.id)
+    card.activePaneId = rec.id
+    return rec
+  }
+
+  get activeCard() {
+    return this.activeCardId ? this.cards.get(this.activeCardId) ?? null : null
+  }
+
+  /** 保证至少一个标签存在，且 activePaneId / activeCardId 有效 */
+  ensurePane() {
+    const card = this.ensureCard()
+    if (card.paneIds.length === 0) {
+      this.addTab(card.id)
+    } else if (!card.activePaneId || !this.panes.has(card.activePaneId)) {
+      card.activePaneId = card.paneIds[0]
+    }
+    if (!this.activePaneId || !this.panes.has(this.activePaneId)) {
+      this.activePaneId = card.activePaneId
+    }
+    this.activeCardId = card.id
+    return this.panes.get(this.activePaneId)
+  }
+
+  /** 关闭标签：落盘（可 discard）→ 从卡片移除；卡片只剩一页关掉 → 该卡片/分屏关闭；激活重指派 */
+  async closePane(paneId, { discard = false } = {}) {
+    const rec = this.panes.get(paneId)
+    if (!rec) return
+    clearTimeout(rec.saveTimer)
+    if (!discard && rec.path && rec.editor) {
+      try {
+        await window.api.pluginFiles.write(PLUGIN_ID, rec.path, rec.editor.state.doc.toString())
+      } catch {
+        /* 落盘失败忽略 */
+      }
+    }
+    rec.editor?.destroy()
+    this.panes.delete(paneId)
+    const card = this.cards.get(rec.cardId)
+    if (card) {
+      card.paneIds = card.paneIds.filter((id) => id !== paneId)
+      if (card.paneIds.length === 0) {
+        // 卡片已空 → 删除卡片；分屏树就地折叠；只剩单卡片 → 回到单卡片模式
+        this.cards.delete(card.id)
+        if (this.splitRoot) {
+          const collapsed = removeLeaf(this.splitRoot, card.id)
+          if (collapsed && collapsed.type === 'split') this.splitRoot = collapsed
+          else this.splitRoot = null
+        }
+        if (this.activeCardId === card.id) {
+          this.activeCardId = [...this.cards.keys()][0] ?? null
+          this.activePaneId = this.activeCardId ? this.cards.get(this.activeCardId).activePaneId : null
+        }
+      } else {
+        if (card.activePaneId === paneId) card.activePaneId = card.paneIds[0]
+        if (this.activeCardId === card.id) this.activePaneId = card.activePaneId
+      }
+    }
+    if (this.lastActivePaneId === paneId) this.lastActivePaneId = null
+    if (this.panes.size === 0) {
+      this.activePaneId = null
+      this.activeCardId = null
+      this.splitRoot = null
+      this.renderSplit()
+      this.updateHead()
+      this.renderTree()
+      this.renderPreview()
+      return
+    }
+    this.renderSplit()
+    this.updateHead()
+    this.activePane?.editor?.focus()
+    this.renderTree()
+    this.renderPreview()
+  }
+
+  /** 打开 path 到指定标签（替换其内容），并设为该卡片激活标签 */
+  async openInPane(paneId, path) {
+    const rec = this.panes.get(paneId)
+    if (!rec) return
+    const card = this.cards.get(rec.cardId)
+    if (card) card.activePaneId = rec.id
+    await this.savePane(paneId)
+    let content
+    try {
+      content = await window.api.pluginFiles.read(PLUGIN_ID, path)
+    } catch (err) {
+      console.error('[notes] 打开失败', path, err)
+      return
+    }
+    // 已有标签打开同一文件时，用其内存中最新内容（分屏复制/二次打开避免读到旧落盘）
+    const live = [...this.panes.values()].find((r) => r.id !== paneId && r.path === path && r.editor)
+    if (live) content = live.editor.state.doc.toString()
+    rec.editor?.destroy()
+    rec.path = path
+    this.selectedItem = path
+    const host = this.shadowRoot.querySelector(`[data-card-id="${rec.cardId}"] [data-editor]`)
+    if (!host) this.renderSplit() // 卡片 DOM 缺失（理论不发生）则补渲染
+    this.createEditorForPane(paneId, content)
+    if (paneId === this.activePaneId) {
+      this.updateHead()
+      this.renderTree()
+      this.renderPreview(paneId)
+    }
+    rec.editor?.focus()
+  }
+
+  /** 拖到内容区：在鼠标落点插入 markdown 链接（拖到哪插到哪）；空面板退化为打开 */
+  insertLinkAt(paneId, path, clientX, clientY) {
+    const rec = this.panes.get(paneId)
+    if (!rec) return
+    if (!rec.path) return this.openInPane(paneId, path)
+    if (!rec.editor) return
+    const pos = rec.editor.posAtCoords({ x: clientX, y: clientY }) ?? rec.editor.state.selection.main.head
+    const title = path.split('/').pop().replace(/\.md$/, '')
+    const link = `[${title}](${path})`
+    rec.editor.dispatch({
+      changes: { from: pos, to: pos, insert: link },
+      selection: { anchor: pos + link.length },
+    })
+    rec.editor.focus()
+  }
+
+  /** 切换激活标签：聚焦所在卡片并设其激活标签、重渲染（卡片内标签/路径刷新） */
+  activatePane(paneId) {
+    if (!this.panes.has(paneId) || paneId === this.activePaneId) return
+    this.lastActivePaneId = this.activePaneId
+    this.activePaneId = paneId
+    const card = this.cards.get(this.panes.get(paneId).cardId)
+    if (card) {
+      card.activePaneId = paneId
+      this.activeCardId = card.id
+    }
+    this.updateHead()
+    this.renderSplit()
+    this.renderTree()
+    this.renderPreview(paneId)
+    this.panes.get(paneId)?.editor?.focus()
+  }
+
+  // ---------- 每面板编辑器与保存 ----------
+  createEditorForPane(paneId, doc) {
+    const rec = this.panes.get(paneId)
+    const host = this.shadowRoot.querySelector(`[data-card-id="${rec?.cardId}"] [data-editor]`)
+    if (!rec || !host) return
     host.innerHTML = ''
     const content = typeof doc === 'string' ? doc : ''
-    this.liveCompartment = new Compartment()
-    this.live = this.viewMode === 'normal'
-    this.editor = new EditorView({
+    rec.liveCompartment = new Compartment()
+    rec.live = rec.mode === 'normal' // 各面板独立显示模式
+    rec.editor = new EditorView({
       state: EditorState.create({
         doc: content,
         extensions: [
           basicSetup,
           markdown({ base: markdownLanguage }), // GFM：表格/任务列表/删除线/自动链接/上下标等
           editorTheme,
-          this.liveCompartment.of(this.live ? livePreviewExt() : []),
+          placeholder('开始输入…'),
+          rec.liveCompartment.of(rec.live ? livePreviewExt() : []),
+          EditorView.domEventHandlers({
+            mousedown: (e, view) => {
+              // 点击任务复选框：切换 `[ ]` ↔ `[x]`，不移动光标
+              const box = e.target.closest('.cm-task-box')
+              if (!box) return false
+              const from = Number(box.dataset.from)
+              const to = Number(box.dataset.to)
+              const text = view.state.sliceDoc(from, to)
+              const next = text.includes('x') ? text.replace('x', ' ') : text.replace(' ', 'x')
+              view.dispatch({ changes: { from, to, insert: next } })
+              e.preventDefault()
+              e.stopPropagation()
+              return true
+            },
+          }),
           EditorView.updateListener.of((u) => {
-            if (u.docChanged) {
-              this.scheduleSave()
-              this.schedulePreview()
+            if (!u.docChanged) return
+            // 外部同步来的改动（其他分屏面板的编辑）：不转发、不由本面板落盘
+            const external = u.transactions.some((tr) => tr.annotation(Sync))
+            if (external) {
+              if (rec.mode === 'preview') this.schedulePreviewPane(paneId)
+              return
             }
+            // 本地编辑：转发给打开同一文件的其他面板，保持各份实时一致
+            this.syncPaneToOthers(paneId, u.transactions)
+            this.scheduleSavePane(paneId)
+            if (rec.mode === 'preview') this.schedulePreviewPane(paneId)
           }),
         ],
       }),
@@ -1192,91 +1771,52 @@ class NotesApp extends HTMLElement {
     })
   }
 
-  scheduleSave() {
-    clearTimeout(this.saveTimer)
-    this.saveTimer = setTimeout(() => void this.saveCurrent(), 600)
+  /** 把某面板的改动同步给打开同一文件的其他面板（分屏多份实时一致） */
+  syncPaneToOthers(paneId, transactions) {
+    const src = this.panes.get(paneId)
+    if (!src?.path || !transactions.length) return
+    for (const [id, rec] of this.panes) {
+      if (id === paneId || rec.path !== src.path || !rec.editor) continue
+      for (const tr of transactions) {
+        rec.editor.dispatch({ changes: tr.changes, annotations: Sync.of(true) })
+      }
+    }
   }
 
-  schedulePreview() {
+  scheduleSavePane(paneId) {
+    const rec = this.panes.get(paneId)
+    if (!rec) return
+    clearTimeout(rec.saveTimer)
+    rec.saveTimer = setTimeout(() => void this.savePane(paneId), 600)
+  }
+
+  schedulePreviewPane(paneId) {
     clearTimeout(this.previewTimer)
     this.previewTimer = setTimeout(() => {
-      if (this.viewMode !== 'source') this.renderPreview()
+      const rec = this.panes.get(paneId)
+      if (rec && rec.mode !== 'source') this.renderPreview(paneId)
     }, 300)
   }
 
-  async saveCurrent() {
-    if (!this.current || !this.editor) return
-    const content = this.editor.state.doc.toString()
+  async savePane(paneId) {
+    const rec = this.panes.get(paneId)
+    if (!rec) return
+    clearTimeout(rec.saveTimer) // 取消防抖定时器：避免删除/切换后旧定时器把文件写回
+    if (!rec.path || !rec.editor) return
     try {
-      await window.api.pluginFiles.write(PLUGIN_ID, this.current, content)
+      await window.api.pluginFiles.write(PLUGIN_ID, rec.path, rec.editor.state.doc.toString())
     } catch (err) {
       console.error('[notes] 保存失败', err)
     }
   }
 
-  // ---------- 分屏 B 面板（源码视图，可拖入笔记 / 关闭） ----------
-  updatePaneB() {
-    if (!this.paneBPath) {
-      this.shadowRoot.querySelector('[data-pane-title-b]').textContent = '分屏'
-      const host = this.shadowRoot.querySelector('[data-editor-b]')
-      if (!this.editorB) host.innerHTML = '<div class="placeholder">拖入笔记到此处打开。</div>'
-      return
-    }
-    const short = this.paneBPath.split('/').pop().replace(/\.md$/, '')
-    this.shadowRoot.querySelector('[data-pane-title-b]').textContent = short
+  saveAll() {
+    return Promise.all([...this.panes.keys()].map((id) => this.savePane(id)))
   }
 
-  async openPaneB(path) {
-    try {
-      const content = await window.api.pluginFiles.read(PLUGIN_ID, path)
-      this.paneBPath = path
-      const host = this.shadowRoot.querySelector('[data-editor-b]')
-      if (this.editorB) this.editorB.destroy()
-      host.innerHTML = ''
-      this.editorB = new EditorView({
-        state: EditorState.create({
-          doc: content,
-          extensions: [
-            basicSetup,
-            markdown({ base: markdownLanguage }),
-            editorTheme,
-            EditorView.updateListener.of((u) => {
-              if (u.docChanged) this.schedulePaneBSave()
-            }),
-          ],
-        }),
-        parent: host,
-      })
-      this.updatePaneB()
-      this.editorB.focus()
-    } catch (err) {
-      console.error('[notes] 分屏打开失败', path, err)
-    }
-  }
-
-  closePaneB() {
-    clearTimeout(this.paneBSaveTimer)
-    if (this.paneBPath && this.editorB) {
-      const content = this.editorB.state.doc.toString()
-      window.api.pluginFiles.write(PLUGIN_ID, this.paneBPath, content).catch(() => {})
-    }
-    this.editorB?.destroy()
-    this.editorB = null
-    this.paneBPath = null
-    const host = this.shadowRoot.querySelector('[data-editor-b]')
-    if (host) host.innerHTML = '<div class="placeholder">拖入笔记到此处打开。</div>'
-    this.updatePaneB()
-  }
-
-  schedulePaneBSave() {
-    clearTimeout(this.paneBSaveTimer)
-    this.paneBSaveTimer = setTimeout(() => {
-      if (this.paneBPath && this.editorB) {
-        window.api.pluginFiles.write(PLUGIN_ID, this.paneBPath, this.editorB.state.doc.toString()).catch((err) => {
-          console.error('[notes] 分屏保存失败', err)
-        })
-      }
-    }, 600)
+  /** 兼容旧调用点：保存激活面板 */
+  saveCurrent() {
+    return this.activePaneId ? this.savePane(this.activePaneId) : Promise.resolve()
   }
 
   // ---------- 排序 ----------
@@ -1333,18 +1873,30 @@ class NotesApp extends HTMLElement {
       const display = path.split('/').pop().replace(/\.md$/, '')
       const ok = await this.openConfirmDialog('删除', `确定删除「${display}」？此操作不可恢复。`)
       if (!ok) return
-      await this.saveCurrent() // 先落盘未保存内容，避免删除后防抖保存把文件写回
+      await this.saveAll() // 先全部落盘，避免删除后防抖写回
       try {
         await window.api.pluginFiles.remove(PLUGIN_ID, path)
-        if (this.paneBPath && (this.paneBPath === path || this.paneBPath.startsWith(path + '/'))) this.closePaneB()
-        if (this.current && (this.current === path || this.current.startsWith(path + '/'))) this.resetEditor()
+      } catch (err) {
+        console.error('[notes] 删除失败', err)
+        return
+      }
+      try {
+        // 关闭所有打开该路径/其后代的面板（discard 防写回）
+        for (const [id, rec] of [...this.panes]) {
+          if (rec.path && (rec.path === path || rec.path.startsWith(path + '/'))) {
+            await this.closePane(id, { discard: true })
+          }
+        }
+        if (this.panes.size === 0) this.resetEditor()
         // 清理展开状态残留（删除的文件夹及其后代）
         for (const p of [...this.expanded]) if (p === path || p.startsWith(path + '/')) this.expanded.delete(p)
         if (this.selectedItem === path || (this.selectedItem && this.selectedItem.startsWith(path + '/'))) this.selectedItem = ROOT
+      } catch (err) {
+        console.error('[notes] 删除后清理异常', err)
+      } finally {
+        // 无论清理是否异常，都强制刷新父目录，避免树节点残留
         const parent = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ROOT
         await this.loadDir(parent)
-      } catch (err) {
-        console.error('[notes] 删除失败', err)
       }
       return
     }
@@ -1357,7 +1909,7 @@ class NotesApp extends HTMLElement {
       return
     }
     if (act === 'move') {
-      await this.saveCurrent()
+      await this.saveAll()
       const folders = await this.collectAllFolders()
       const display = path.split('/').pop().replace(/\.md$/, '')
       const target = await this.openFolderDialog(`移动「${display}」到`, folders, path)
@@ -1366,9 +1918,12 @@ class NotesApp extends HTMLElement {
       if (newPath === path) return
       try {
         await window.api.pluginFiles.move(PLUGIN_ID, path, newPath)
-        if (this.paneBPath && (this.paneBPath === path || this.paneBPath.startsWith(path + '/'))) this.closePaneB()
-        if (this.current && (this.current === path || this.current.startsWith(path + '/'))) {
-          this.current = newPath + this.current.slice(path.length)
+        // 打开该路径/后代的面板：重写路径前缀并刷新标题
+        for (const rec of this.panes.values()) {
+          if (rec.path && (rec.path === path || rec.path.startsWith(path + '/'))) {
+            rec.path = newPath + rec.path.slice(path.length)
+            this.updatePaneTitle(rec.id)
+          }
         }
         if (this.selectedItem && (this.selectedItem === path || this.selectedItem.startsWith(path + '/'))) {
           this.selectedItem = newPath + this.selectedItem.slice(path.length)
@@ -1385,7 +1940,7 @@ class NotesApp extends HTMLElement {
   }
 
   async renameEntry(path) {
-    await this.saveCurrent()
+    await this.saveAll()
     const name = path.split('/').pop()
     const isMd = name.endsWith('.md')
     const value = await this.openInputDialog('重命名', '新名称', isMd ? name.slice(0, -3) : name)
@@ -1396,9 +1951,12 @@ class NotesApp extends HTMLElement {
     const newPath = (parent ? parent + '/' : '') + bare + (isMd ? '.md' : '')
     try {
       await window.api.pluginFiles.move(PLUGIN_ID, path, newPath)
-      if (this.paneBPath && (this.paneBPath === path || this.paneBPath.startsWith(path + '/'))) this.closePaneB()
-      if (this.current && (this.current === path || this.current.startsWith(path + '/'))) {
-        this.current = newPath + this.current.slice(path.length)
+      // 打开该路径/后代的面板：重写路径前缀并刷新标题
+      for (const rec of this.panes.values()) {
+        if (rec.path && (rec.path === path || rec.path.startsWith(path + '/'))) {
+          rec.path = newPath + rec.path.slice(path.length)
+          this.updatePaneTitle(rec.id)
+        }
       }
       if (this.selectedItem && (this.selectedItem === path || this.selectedItem.startsWith(path + '/'))) {
         this.selectedItem = newPath + this.selectedItem.slice(path.length)
@@ -1427,22 +1985,26 @@ class NotesApp extends HTMLElement {
   }
 
   resetEditor() {
-    this.closePaneB()
-    this.current = null
-    this.editor?.destroy()
-    this.editor = null
-    this.viewMode = 'normal'
-    this.live = true
-    this.liveCompartment = null
+    for (const rec of this.panes.values()) {
+      clearTimeout(rec.saveTimer)
+      if (rec.path && rec.editor) {
+        const content = rec.editor.state.doc.toString() // 先捕获内容再写（fire-and-forget）
+        window.api.pluginFiles.write(PLUGIN_ID, rec.path, content).catch(() => {})
+      }
+      rec.editor?.destroy()
+    }
+    this.panes.clear()
+    this.cards.clear()
+    this.splitRoot = null
+    this.activePaneId = null
+    this.activeCardId = null
+    this.lastActivePaneId = null
     this.navOpen = false
     this.navQuery = ''
     this.filter = ''
     clearTimeout(this.previewTimer)
-    this.shadowRoot.querySelector('[data-editor]').innerHTML = '<div class="placeholder">选择或新建一篇笔记开始。</div>'
-    this.shadowRoot.querySelector('[data-note-title]').textContent = '选择一篇笔记'
-    this.shadowRoot.querySelector('[data-pane-title-a]').textContent = ''
-    this.shadowRoot.querySelector('[data-head-actions]').classList.remove('show')
-    this.shadowRoot.querySelector('[data-preview]').innerHTML = ''
+    this.renderSplit() // 回全局占位
+    this.updateHead()
     this.shadowRoot.querySelector('[data-nav]').classList.add('hidden')
     this.shadowRoot.querySelector('[data-nav-search]').value = ''
     this.shadowRoot.querySelector('[data-nav-search-clear]').classList.remove('show')
@@ -1450,6 +2012,7 @@ class NotesApp extends HTMLElement {
     const editor = this.shadowRoot.querySelector('.editor')
     editor.classList.remove('mode-normal', 'mode-source', 'mode-preview', 'mode-split', 'mode-split-v')
     editor.classList.add('mode-normal')
+    this.renderMoreMenu()
   }
 
   async collectAllFolders() {
@@ -1587,5 +2150,8 @@ const ICON_CTX_RENAME = '<svg viewBox="0 0 24 24" fill="none" stroke="currentCol
 const ICON_CTX_DELETE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>'
 const ICON_FOLDER_SM = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>'
 const ICON_DOC_SM = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>'
+const ICON_PLUS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>'
 
 customElements.define('app-plugin-notes', NotesApp)
+
+

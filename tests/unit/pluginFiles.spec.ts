@@ -40,6 +40,9 @@ describe('plugin-files 读写', () => {
     expect(root[0].isDirectory).toBe(true)
     const sub = await listPluginFiles('t-list', 'folder')
     expect(sub.map((e) => e.name)).toEqual(['c.md'])
+    // 契约：相对路径统一正斜杠（`a/b.md`），跨平台一致（Windows path.join 会产生反斜杠）
+    expect(root[0].path).toBe('folder')
+    expect(sub[0].path).toBe('folder/c.md')
   })
 
   it('list 返回 createdMs（创建时间）', async () => {

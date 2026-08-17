@@ -82,9 +82,12 @@ export async function listPluginFiles(
   for (const e of entries) {
     const abs = join(dir, e.name)
     const st = await stat(abs)
+    // 契约路径统一正斜杠（`a/b.md`）。path.join 在 Windows 产生反斜杠，这里归一化——
+    // 否则渲染层按 `/` 拆分（lastIndexOf('/') 算父目录等）会算错，删除/移动后不刷新树。
+    const rel = dirRel ? join(dirRel, e.name) : e.name
     out.push({
       name: e.name,
-      path: dirRel ? join(dirRel, e.name) : e.name,
+      path: rel.replace(/\\/g, '/'),
       isDirectory: e.isDirectory(),
       size: st.size,
       mtimeMs: st.mtimeMs,
