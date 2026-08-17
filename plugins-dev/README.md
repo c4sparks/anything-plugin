@@ -16,7 +16,7 @@ plugins-dev/<id>/            # 独立 npm 包（自带 package.json + node_modul
 ## 规则
 
 - 壳子代码 `src/` 与插件源码互不引用：插件源码按独立 npm 包自管理依赖（`plugins-dev/<id>` 内独立 `pnpm install`）。
-- 构建脚本（`scripts/build-plugin.mjs`，M2）在插件源码目录内执行，产物为单文件 ESM，写入 `resources/plugins/<id>/entry.js`。
+- 构建脚本（`scripts/build-plugin.mjs`，M2）在插件源码目录内执行，产物为单文件 ESM，写入 `resources/plugins/<id>/entry.js`。命令：`pnpm build:plugin <id>`（一次性）、`pnpm build:plugin:watch <id>`（watch 模式，改源码/manifest 自动重建）。
 - 打包排除：`plugins-dev/**` 不进安装包/asar（electron-builder files 已排除）。
 - 插件源码应纳入版本控制；插件自身 node_modules 由全局 `node_modules` 规则忽略。
 - 卸载/升级语义：壳子只认 `resources/plugins/<id>/`（或 prod `userData/plugins/<id>/`），与源码目录无关。
@@ -25,7 +25,7 @@ plugins-dev/<id>/            # 独立 npm 包（自带 package.json + node_modul
 
 - **运行时**：外部插件走 Blob 加载、单文件 ESM，依赖必须内联进打包产物，**无法也不应使用壳子 node_modules**。
 - **构建时依赖**：插件在自身目录独立 `pnpm install`（依赖版本自定义）；esbuild 从插件 node_modules 解析并内联。壳子 node_modules 仅在插件恰好复用壳子已有依赖时可选兜底（会造成版本耦合，不推荐）。
-- **调试**：插件运行时用壳子 DevTools 排查；源码级调试用构建脚本 `--debug`（不压缩 + sourcemap），改源码 → debug 构建 → 壳子重扫/重载生效。
+- **调试**：插件运行时用壳子 DevTools 排查；源码级调试用构建脚本 `--debug`（不压缩 + sourcemap），开发时 `pnpm build:plugin:watch <id>` 改源码自动重建 → 壳子重扫/重载生效。
 
 ## 现状
 

@@ -1,9 +1,11 @@
 # AnythingPlugin
 
-基于 **Electron + Vue 3 + electron-vite + pnpm** 的**万物皆插件**桌面应用壳。
+基于 **Electron + Vue 3 + electron-vite + pnpm** 的**万物皆插件**桌面应用框架：壳层不内置功能，一切能力以插件形式即插即用。
 
-核心定位：**应用壳本身不内置功能，一切靠插件**——扩展功能的 UI 以 Web Component 挂载到壳层槽位，
-外部宿主应用（如 agent）以独立进程嵌入。
+- **Web Component 插件**：扩展功能的 UI 以自定义元素（`app-plugin-*`）挂载到壳层侧栏 / 内容区 / 状态栏槽位，即装即用、按需卸载；
+- **外部宿主应用**：`hostApp` 插件以独立进程运行并嵌入其 Web UI，内置 DeepSeek Harness（AI 助手）即为典型；
+- **插件管理**：统一列表 + 搜索（多关键词 / 拼音）、本地 zip 导入、市场安装、目录监听即时刷新，内置/外部信任分层 + 安全模式门控；
+- **主题与打包**：深浅主题一键切换并持久化；electron-builder 把侧车运行时打进安装包，装完即用。
 
 ## 核心特性
 
@@ -29,10 +31,14 @@
 ## 快速开始
 
 ```sh
-pnpm install          # 安装依赖（electron 二进制已配 npmmirror 镜像）
+pnpm install          # 安装依赖（postinstall 自动确保 electron 二进制就位）
 pnpm dev              # 开发（HMR + 自动启动 Electron）
 pnpm build            # 类型检查 + 构建到 out/
 ```
+
+> **electron 二进制**：`pnpm install` 的 postinstall 钩子自动执行 `node node_modules/electron/install.js`
+> （幂等：二进制在则秒退，缺失则从本地缓存/镜像解压，下载 zip 缓存在 `%LOCALAPPDATA%\electron\Cache`）。
+> 若遇 `Error: Electron uninstall`，是 pnpm 在依赖无变化时跳过脚本所致——手动 `pnpm run postinstall` 一次即可。
 
 全部常用命令：
 
@@ -46,6 +52,8 @@ pnpm build            # 类型检查 + 构建到 out/
 | `pnpm test:e2e` | Playwright Electron e2e（需先 build） |
 | `pnpm build` | 类型检查 + 构建到 `out/` |
 | `pnpm package:sidecar` | 生成打包sidecar运行时 `resources/dsh-host`（幂等：缺失或 dsh 版本变化才生成） |
+| `pnpm build:plugin <id>` | 打包型插件一次性构建（`plugins-dev/<id>` → `resources/plugins/<id>`） |
+| `pnpm build:plugin:watch <id>` | 打包型插件 watch 模式：改源码 / manifest 自动重建（开发用，Ctrl+C 退出） |
 | `pnpm build:win` | 构建 + 自动准备 sidecar + electron-builder 打包（win-nsis） |
 | `pnpm build:mac` | 构建 + electron-builder 打包（mac-dmg，需 macOS 环境） |
 | `pnpm build:linux` | 构建 + electron-builder 打包（linux-AppImage） |

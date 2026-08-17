@@ -382,9 +382,6 @@ class NotesApp extends HTMLElement {
     this.sideCollapsed = false
     this.sideWidth = 260
     this.morePaneId = null // 更多菜单当前作用的面板 id
-    this.navOpen = false // 导航面板默认隐藏，点「更多 → 导航」显示/关闭
-    this.navQuery = ''
-    this.outline = [] // [{el, level, text}]
     this.previewTimer = null
     this.context = null // {x,y,path,kind}
     this.dialog = null // {title, mode:'input'|'folder'|'confirm', resolve, message?}
@@ -439,8 +436,8 @@ class NotesApp extends HTMLElement {
           overflow: hidden;
         }
         .side { width: 260px; flex: none; display: flex; flex-direction: column; border-right: 1px solid var(--border, #d9dce2); background: var(--surface-2, #eceef1); }
-        /* 折叠为窄条：只留折叠/展开按钮 */
-        .side.collapsed { width: 30px !important; }
+        /* 折叠为窄条：只留折叠/展开按钮（宽度 = SIDE_COLLAPSED 36px，容纳 30px 按钮 + 4px 工具栏内边距） */
+        .side.collapsed { width: 36px !important; }
         /* 书本图标整体隐藏/显示侧边栏 */
         .side.hidden { display: none; }
         .side.collapsed .toolbar { flex-direction: column; gap: 2px; justify-content: flex-start; }
@@ -577,6 +574,20 @@ class NotesApp extends HTMLElement {
         .card-more svg { width: 14px; height: 14px; }
         .card-more:hover { background: var(--surface-2, #eceef1); color: var(--text, #1a1d23); }
         .card.active { box-shadow: inset 0 2px 0 var(--accent, #0e7c6b); } /* 聚焦卡片顶边高亮 */
+        /* 卡片主体：左=编辑器，右=卡片导航（搜索+大纲） */
+        .card-body { flex: 1; min-height: 0; display: flex; }
+        .card-editor { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+        .card-nav { flex: none; width: 220px; min-width: 0; border-left: 1px solid var(--border, #d9dce2); background: var(--surface-2, #eceef1); display: flex; flex-direction: column; min-height: 0; }
+        .card-nav-toolbar { display: flex; align-items: center; gap: var(--space-1, 4px); padding: var(--space-2, 8px); border-bottom: 1px solid var(--border, #d9dce2); }
+        .card-nav-search { flex: 1; width: 100%; height: 24px; padding: 0 var(--space-2, 8px); border: 1px solid var(--border, #d9dce2); border-radius: var(--radius-pill, 999px); background: var(--surface, #fff); color: var(--text, #1a1d23); font-size: var(--font-size-xs, 12px); outline: none; }
+        .card-nav-search:focus { border-color: var(--accent, #0e7c6b); box-shadow: 0 0 0 2px var(--focus-ring, rgba(14,124,107,.35)); }
+        .card-nav-clear { flex: none; width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; border: none; border-radius: 50%; background: var(--border-strong, #b6bcc7); color: var(--surface, #fff); cursor: pointer; padding: 0; font-size: 11px; line-height: 1; }
+        .card-nav-clear:hover { background: var(--text-muted, #5b6370); }
+        .card-nav-outline { flex: 1; overflow-y: auto; padding: var(--space-2, 8px); }
+        .card-nav-outline mark { background: #ffd54d; color: #3a2d00; border-radius: 2px; padding: 0 1px; font-weight: 600; }
+        .nav-item { padding: 3px var(--space-2, 8px); border-radius: var(--radius-sm, 4px); cursor: pointer; font-size: var(--font-size-sm, 13px); color: var(--text-muted, #5b6370); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .nav-item:hover { background: var(--surface, #fff); color: var(--text, #1a1d23); }
+        .nav-empty { padding: var(--space-2, 8px); font-size: var(--font-size-sm, 13px); color: var(--text-muted, #5b6370); }
         /* 多开拆分：递归 .split 容器 + .pane；布局由拆分树驱动，viewMode 不决定布局 */
         .split { flex: 1; min-width: 0; min-height: 0; display: flex; }
         .split[data-dir="row"] { flex-direction: row; }
@@ -714,17 +725,6 @@ class NotesApp extends HTMLElement {
         <section class="editor">
           <div class="editor-body">
             <div class="main" data-split-root></div>
-            <div class="nav-pane hidden" data-nav>
-              <div class="nav-toolbar">
-                <div class="search-wrap">
-                  <input class="side-search" type="text" placeholder="搜索…" spellcheck="false" aria-label="搜索" data-nav-search />
-                  <button type="button" class="search-clear" data-nav-search-clear title="清除搜索" aria-label="清除搜索">
-                    <svg viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M1 1l8 8M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-                  </button>
-                </div>
-              </div>
-              <div class="nav-outline" data-nav-outline></div>
-            </div>
           </div>
         </section>
         <div class="menu" data-sort-menu></div>
@@ -755,27 +755,6 @@ class NotesApp extends HTMLElement {
     root.querySelector('[data-act="sort"]').addEventListener('click', (e) => this.toggleSortMenu(e))
     root.querySelector('[data-act="expand"]').addEventListener('click', () => this.toggleExpandAll())
     root.querySelector('[data-act="toggle-side"]').addEventListener('click', () => this.toggleSide())
-    root.querySelector('[data-nav-search]').addEventListener('input', (e) => {
-      const v = e.target.value.trim().toLowerCase()
-      this.navQuery = v
-      this.shadowRoot.querySelector('[data-nav-search-clear]').classList.toggle('show', e.target.value.length > 0)
-      this.renderPreview() // 只作用于导航面板：过滤/高亮大纲标题 + 高亮预览内容
-    })
-    root.querySelector('[data-nav-search-clear]').addEventListener('click', (e) => {
-      e.stopPropagation()
-      const input = this.shadowRoot.querySelector('[data-nav-search]')
-      input.value = ''
-      this.navQuery = ''
-      this.shadowRoot.querySelector('[data-nav-search-clear]').classList.remove('show')
-      this.renderPreview()
-      input.focus()
-    })
-    root.querySelector('[data-nav-outline]').addEventListener('click', (e) => {
-      const item = e.target.closest('[data-nav-idx]')
-      if (!item) return
-      const entry = this.outline[Number(item.dataset.navIdx)]
-      if (entry?.el) entry.el.scrollIntoView({ block: 'start', behavior: 'smooth' })
-    })
     root.querySelector('[data-more-menu]').addEventListener('click', (e) => {
       const item = e.target.closest('[data-more-act]')
       if (!item) return
@@ -790,6 +769,24 @@ class NotesApp extends HTMLElement {
       const card = e.target.closest('[data-card-id]')
       if (!card) return
       const cardId = card.dataset.cardId
+      if (e.target.closest('.card-nav-clear')) {
+        e.stopPropagation()
+        const c = this.cards.get(cardId)
+        if (c) {
+          c.navQuery = ''
+          this.applyNavHighlight(c)
+          this.renderOutline(c)
+          const input = this.shadowRoot.querySelector(`[data-card-nav-search="${cardId}"]`)
+          if (input) input.value = ''
+        }
+        return
+      }
+      if (e.target.closest('[data-card-nav-idx]')) {
+        const c = this.cards.get(cardId)
+        const entry = c?.outline[Number(e.target.closest('[data-card-nav-idx]').dataset.cardNavIdx)]
+        if (entry?.el) entry.el.scrollIntoView({ block: 'start', behavior: 'smooth' })
+        return
+      }
       if (e.target.closest('.ctab-close')) {
         e.stopPropagation()
         void this.closePane(e.target.closest('.ctab-close').dataset.cardTabClose)
@@ -815,6 +812,16 @@ class NotesApp extends HTMLElement {
       }
       const paneId = this.cards.get(cardId)?.activePaneId
       if (paneId) this.activatePane(paneId) // 点卡片其它区域 → 聚焦该卡片激活标签
+    })
+    // 卡片导航搜索输入：实时过滤该卡片的预览高亮 + 大纲
+    splitRoot.addEventListener('input', (e) => {
+      const search = e.target.closest('[data-card-nav-search]')
+      if (!search) return
+      const c = this.cards.get(search.dataset.cardNavSearch)
+      if (!c) return
+      c.navQuery = search.value.trim().toLowerCase()
+      this.applyNavHighlight(c)
+      this.renderOutline(c)
     })
     splitRoot.addEventListener('focusin', (e) => {
       const card = e.target.closest('[data-card-id]')
@@ -1092,7 +1099,7 @@ class NotesApp extends HTMLElement {
     splitter.classList.add('dragging')
     document.body.style.userSelect = 'none'
     const onMove = (ev) => {
-      // 最小宽度 = 折叠按钮窄条宽度（30px），再左拖即贴到最窄
+      // 最小宽度 = 折叠按钮窄条宽度（36px），再左拖即贴到最窄
       // 侧栏宽度自适应：上限整宽 40% 且 ≤400px，保证笔记页面始终有足够显示空间
       const width = Math.min(Math.max(ev.clientX - appRect.left, SIDE_COLLAPSED), Math.round(appRect.width * 0.4), 400)
       side.style.width = width + 'px'
@@ -1221,7 +1228,10 @@ class NotesApp extends HTMLElement {
   }
 
   moreActive(act, paneId) {
-    if (act === 'nav') return this.navOpen
+    if (act === 'nav') {
+      const pane = this.panes.get(paneId)
+      return pane ? this.cards.get(pane.cardId)?.navOpen : false
+    }
     const pane = this.panes.get(paneId ?? this.activePaneId)
     return pane?.mode === act
   }
@@ -1230,17 +1240,18 @@ class NotesApp extends HTMLElement {
     if (act === 'normal' || act === 'source' || act === 'preview') return this.setPaneMode(paneId, act)
     if (act === 'split') return this.splitActive('row')
     if (act === 'split-v') return this.splitActive('column')
-    if (act === 'nav') return this.toggleNav()
+    if (act === 'nav') return this.toggleNav(this.panes.get(paneId)?.cardId)
   }
 
   hideMoreMenu() {
     this.shadowRoot.querySelector('[data-more-menu]').classList.remove('show')
   }
 
-  toggleNav() {
-    this.navOpen = !this.navOpen
-    this.shadowRoot.querySelector('[data-nav]').classList.toggle('hidden', !this.navOpen)
-    if (this.navOpen) this.renderPreview()
+  toggleNav(cardId) {
+    const card = this.cards.get(cardId) ?? this.ensureCard()
+    card.navOpen = !card.navOpen
+    if (card.navOpen) this.renderPreview(card.activePaneId)
+    this.renderSplit()
     this.renderMoreMenu()
   }
 
@@ -1256,28 +1267,33 @@ class NotesApp extends HTMLElement {
     const raw = content ? marked.parse(content) : ''
     const safe = content ? DOMPurify.sanitize(raw) : ''
     preview.innerHTML = safe
-    if (target.id === this.activePaneId) {
-      this.applyNavHighlight()
-      this.buildOutline()
+    // 该卡片导航开着 → 应用该卡片自己的搜索高亮 + 重建大纲
+    if (card && card.navOpen && target.id === card.activePaneId) {
+      this.applyNavHighlight(card)
+      this.renderOutline(card)
     }
   }
 
-  applyNavHighlight() {
-    if (!this.navQuery) return
-    const rec = this.activePane
-    if (!rec) return
-    const preview = this.shadowRoot.querySelector(`[data-card-id="${rec.cardId}"] [data-preview]`)
+  /** 在指定卡片的预览上高亮该卡片的搜索词 */
+  applyNavHighlight(card) {
+    const q = card.navQuery
+    if (!q) return
+    const target = this.panes.get(card.activePaneId)
+    if (!target) return
+    const preview = this.shadowRoot.querySelector(`[data-card-id="${card.id}"] [data-preview]`)
+    if (!preview) return
     const walker = document.createTreeWalker(preview, NodeFilter.SHOW_TEXT)
     const targets = []
     while (walker.nextNode()) {
       const node = walker.currentNode
       if (node.parentElement?.closest('pre, code, script, style')) continue
+      if (!node.parentElement?.closest('h1,h2,h3,h4,h5,h6')) continue // 导航只搜标题内容
       targets.push(node)
     }
     for (const node of targets) {
       const text = node.textContent
       const lower = text.toLowerCase()
-      let idx = lower.indexOf(this.navQuery)
+      let idx = lower.indexOf(q)
       if (idx === -1) continue
       const frag = document.createDocumentFragment()
       let i = 0
@@ -1285,31 +1301,34 @@ class NotesApp extends HTMLElement {
         if (idx > i) frag.appendChild(document.createTextNode(text.slice(i, idx)))
         const mark = document.createElement('mark')
         mark.className = 'nav-hl'
-        mark.textContent = text.slice(idx, idx + this.navQuery.length)
+        mark.textContent = text.slice(idx, idx + q.length)
         frag.appendChild(mark)
-        i = idx + this.navQuery.length
-        idx = lower.indexOf(this.navQuery, i)
+        i = idx + q.length
+        idx = lower.indexOf(q, i)
       }
       if (i < text.length) frag.appendChild(document.createTextNode(text.slice(i)))
       node.parentNode.replaceChild(frag, node)
     }
   }
 
-  buildOutline() {
-    const rec = this.activePane
-    if (!rec) return
-    const preview = this.shadowRoot.querySelector(`[data-card-id="${rec.cardId}"] [data-preview]`)
-    this.outline = [...preview.querySelectorAll('h1,h2,h3,h4,h5,h6')].map((el) => ({
+  /** 重建指定卡片的标题大纲（按该卡片搜索词过滤标题，命中高亮），渲染到该卡片的导航区 */
+  renderOutline(card) {
+    const target = this.panes.get(card.activePaneId)
+    if (!target) return
+    const preview = this.shadowRoot.querySelector(`[data-card-id="${card.id}"] [data-preview]`)
+    if (!preview) return
+    card.outline = [...preview.querySelectorAll('h1,h2,h3,h4,h5,h6')].map((el) => ({
       el,
       level: Number(el.tagName[1]),
       text: el.textContent || '',
     }))
-    const box = this.shadowRoot.querySelector('[data-nav-outline]')
-    if (!this.outline.length) {
+    const box = this.shadowRoot.querySelector(`[data-card-nav-outline="${card.id}"]`)
+    if (!box) return
+    const q = card.navQuery
+    if (!card.outline.length) {
       box.innerHTML = '<div class="nav-empty">暂无标题大纲。</div>'
       return
     }
-    const q = this.navQuery
     const hl = (text) => {
       if (!q) return this.escapeHtml(text)
       const lower = text.toLowerCase()
@@ -1325,7 +1344,7 @@ class NotesApp extends HTMLElement {
       if (i < text.length) parts.push(this.escapeHtml(text.slice(i)))
       return parts.join('')
     }
-    const items = this.outline.map((o, i) => ({ o, i })).filter(({ o }) => !q || o.text.toLowerCase().includes(q))
+    const items = card.outline.map((o, i) => ({ o, i })).filter(({ o }) => !q || o.text.toLowerCase().includes(q))
     if (!items.length) {
       box.innerHTML = '<div class="nav-empty">没有匹配的标题。</div>'
       return
@@ -1333,7 +1352,7 @@ class NotesApp extends HTMLElement {
     box.innerHTML = items
       .map(
         ({ o, i }) =>
-          `<div class="nav-item" data-nav-idx="${i}" style="padding-left:${(o.level - 1) * 12 + 8}px">${hl(o.text)}</div>`,
+          `<div class="nav-item" data-card-nav-idx="${i}" style="padding-left:${(o.level - 1) * 12 + 8}px">${hl(o.text)}</div>`,
       )
       .join('')
   }
@@ -1451,21 +1470,26 @@ class NotesApp extends HTMLElement {
     this.renderSplit()
   }
 
-  /** 渲染 .main：普通态只显示激活面板（多标签堆叠）；分屏态渲染分屏树，并隐藏全局标签栏 */
+  /** 渲染 .main：普通态渲染当前卡片；分屏态渲染卡片树。渲染后刷新各卡片预览/导航 */
   renderSplit() {
     const main = this.shadowRoot.querySelector('[data-split-root]')
     if (!main) return
     main.innerHTML = ''
     if (this.splitRoot) {
       main.appendChild(this.renderSplitNode(this.splitRoot))
-      return
+    } else {
+      const card = this.activeCard
+      if (!card || card.paneIds.length === 0) {
+        main.innerHTML = '<div class="placeholder">选择或新建一篇笔记开始。</div>'
+      } else {
+        main.appendChild(this.renderCard(card.id))
+      }
     }
-    const card = this.activeCard
-    if (!card || card.paneIds.length === 0) {
-      main.innerHTML = '<div class="placeholder">选择或新建一篇笔记开始。</div>'
-      return
+    // 预览模式或导航开着的卡片：重渲染预览/大纲（markdown 预览、搜索高亮）
+    for (const card of this.cards.values()) {
+      const active = this.panes.get(card.activePaneId)
+      if (active && (active.mode === 'preview' || card.navOpen)) this.renderPreview(active.id)
     }
-    main.appendChild(this.renderCard(card.id))
   }
 
   renderSplitNode(node) {
@@ -1495,6 +1519,7 @@ class NotesApp extends HTMLElement {
       return el
     }
     const pane = this.panes.get(card.activePaneId)
+    el.dataset.mode = pane?.mode ?? 'normal' // 显示模式（normal/source/preview）随激活标签
     // 卡片标签栏：该卡片打开的笔记页签 + 新建
     const tabs = document.createElement('div')
     tabs.className = 'card-tabs'
@@ -1514,21 +1539,42 @@ class NotesApp extends HTMLElement {
     page.className = 'card-page'
     page.innerHTML = `<span class="card-crumb">${pane?.path ? this.escapeHtml(pane.path.replace(/\.md$/, '')) : ''}</span><button type="button" class="card-more" data-card-more title="更多" aria-label="更多">${ICON_MORE}</button>`
     el.appendChild(page)
-    // 编辑器
+    // 编辑器 + 预览（左侧）+ 卡片导航（右侧，可选，每卡片独立搜索+大纲）
+    const body = document.createElement('div')
+    body.className = 'card-body'
+    const editorCol = document.createElement('div')
+    editorCol.className = 'card-editor'
     const cm = document.createElement('div')
     cm.className = 'cm-wrap'
     cm.dataset.editor = ''
-    const holder = document.createElement('div')
-    holder.className = 'placeholder'
-    holder.textContent = pane?.path ? '' : '拖入笔记到此处打开。'
-    cm.appendChild(holder)
-    if (pane?.editor) cm.appendChild(pane.editor.dom) // 复用编辑器实例，不重建
-    el.appendChild(cm)
-    // 预览
+    if (pane?.editor) {
+      cm.appendChild(pane.editor.dom) // 复用编辑器实例，不重建
+    } else {
+      const holder = document.createElement('div')
+      holder.className = 'placeholder'
+      holder.textContent = '拖入笔记到此处打开。'
+      cm.appendChild(holder)
+    }
+    editorCol.appendChild(cm)
     const preview = document.createElement('div')
     preview.className = 'preview'
     preview.dataset.preview = ''
-    el.appendChild(preview)
+    // 预览模式：直接内联渲染 markdown 预览（重渲染后不依赖额外调用）
+    if (pane?.mode === 'preview') {
+      const content = pane.editor?.state.doc.toString() ?? ''
+      preview.innerHTML = content ? DOMPurify.sanitize(marked.parse(content)) : ''
+    }
+    editorCol.appendChild(preview)
+    body.appendChild(editorCol)
+    if (card.navOpen) {
+      const nav = document.createElement('div')
+      nav.className = 'card-nav'
+      nav.innerHTML =
+        `<div class="card-nav-toolbar"><input class="card-nav-search" data-card-nav-search="${card.id}" value="${this.escapeAttr(card.navQuery)}" placeholder="搜索…" spellcheck="false" /><button type="button" class="card-nav-clear" data-card-nav-clear="${card.id}" title="清除搜索" aria-label="清除搜索">×</button></div>` +
+        `<div class="card-nav-outline" data-card-nav-outline="${card.id}"></div>`
+      body.appendChild(nav)
+    }
+    el.appendChild(body)
     return el
   }
 
@@ -1556,7 +1602,7 @@ class NotesApp extends HTMLElement {
 
   /** 新建一张分屏卡片（含独立标签栏） */
   createCard() {
-    const card = { id: 'card-' + this.nextCardId++, paneIds: [], activePaneId: null }
+    const card = { id: 'card-' + this.nextCardId++, paneIds: [], activePaneId: null, navOpen: false, navQuery: '', outline: [] }
     this.cards.set(card.id, card)
     return card
   }
@@ -1757,13 +1803,14 @@ class NotesApp extends HTMLElement {
             // 外部同步来的改动（其他分屏面板的编辑）：不转发、不由本面板落盘
             const external = u.transactions.some((tr) => tr.annotation(Sync))
             if (external) {
-              if (rec.mode === 'preview') this.schedulePreviewPane(paneId)
+              if (this.needsLivePreview(rec)) this.schedulePreviewPane(paneId)
               return
             }
             // 本地编辑：转发给打开同一文件的其他面板，保持各份实时一致
             this.syncPaneToOthers(paneId, u.transactions)
             this.scheduleSavePane(paneId)
-            if (rec.mode === 'preview') this.schedulePreviewPane(paneId)
+            // 预览模式或该卡片导航开着 → 实时刷新预览/大纲/全文搜索
+            if (this.needsLivePreview(rec)) this.schedulePreviewPane(paneId)
           }),
         ],
       }),
@@ -1790,11 +1837,17 @@ class NotesApp extends HTMLElement {
     rec.saveTimer = setTimeout(() => void this.savePane(paneId), 600)
   }
 
+  /** 预览模式或卡片导航开着时，才需要实时刷新预览/大纲/全文搜索 */
+  needsLivePreview(rec) {
+    const card = rec ? this.cards.get(rec.cardId) : null
+    return !!rec && (rec.mode === 'preview' || !!card?.navOpen)
+  }
+
   schedulePreviewPane(paneId) {
     clearTimeout(this.previewTimer)
     this.previewTimer = setTimeout(() => {
       const rec = this.panes.get(paneId)
-      if (rec && rec.mode !== 'source') this.renderPreview(paneId)
+      if (this.needsLivePreview(rec)) this.renderPreview(paneId)
     }, 300)
   }
 
@@ -1999,16 +2052,10 @@ class NotesApp extends HTMLElement {
     this.activePaneId = null
     this.activeCardId = null
     this.lastActivePaneId = null
-    this.navOpen = false
-    this.navQuery = ''
     this.filter = ''
     clearTimeout(this.previewTimer)
     this.renderSplit() // 回全局占位
     this.updateHead()
-    this.shadowRoot.querySelector('[data-nav]').classList.add('hidden')
-    this.shadowRoot.querySelector('[data-nav-search]').value = ''
-    this.shadowRoot.querySelector('[data-nav-search-clear]').classList.remove('show')
-    this.shadowRoot.querySelector('[data-nav-outline]').innerHTML = '<div class="nav-empty">暂无标题大纲。</div>'
     const editor = this.shadowRoot.querySelector('.editor')
     editor.classList.remove('mode-normal', 'mode-source', 'mode-preview', 'mode-split', 'mode-split-v')
     editor.classList.add('mode-normal')
