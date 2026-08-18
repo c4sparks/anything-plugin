@@ -70,6 +70,8 @@ const baseOptions = {
   minify: !debug,
   sourcemap: debug ? 'linked' : false,
   define: { 'process.env.NODE_ENV': debug ? '"development"' : '"production"' },
+  // 样式表以文本内联（hljs 主题 / katex CSS 经 `import xxx from '...css'` 打进单文件）
+  loader: { '.css': 'text' },
   logLevel: 'info',
 }
 

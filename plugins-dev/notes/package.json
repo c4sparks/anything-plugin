@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.21.0",
-  "description": "笔记插件 TypeScript 移植：多文件源码（src/）→ 单文件 ESM 产物（dist/entry.js）",
+  "description": "笔记插件 TypeScript ：多文件源码（src/）→ 单文件 ESM 产物（dist/entry.js）",
   "scripts": {
     "build": "node scripts/build.mjs",
     "build:debug": "node scripts/build.mjs --debug",
@@ -13,13 +13,16 @@
   },
   "dependencies": {
     "@codemirror/lang-markdown": "^6.3.4",
-    "@lezer/common": "^1.2.3",
     "@codemirror/language": "^6.11.0",
     "@codemirror/state": "^6.5.2",
     "@codemirror/view": "^6.38.1",
+    "@lezer/common": "^1.2.3",
     "codemirror": "^6.0.2",
     "dompurify": "^3.4.13",
-    "marked": "^18.0.9"
+    "highlight.js": "^11.12.0",
+    "katex": "^0.18.4",
+    "marked": "^18.0.9",
+    "minisearch": "^7.2.0"
   },
   "devDependencies": {
     "esbuild": "^0.25.11",

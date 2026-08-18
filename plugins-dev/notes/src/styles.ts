@@ -1,4 +1,8 @@
 // 壳层样式（原 entry.js renderShell 内嵌 <style>，原样提取；变量走宿主 CSS 变量并带兜底值）
+// P2：内联 highlight.js 主题与 KaTeX 布局 CSS（构建脚本以 text loader 注入；字体 404 时回退系统字体）
+import hljsTheme from 'highlight.js/styles/github.css'
+import katexCss from 'katex/dist/katex.min.css'
+
 export const SHELL_CSS = `
         :host { display: block; width: 100%; height: 100%; min-height: 480px; }
         * { box-sizing: border-box; }
@@ -41,6 +45,20 @@ export const SHELL_CSS = `
           background: var(--surface, #fff); color: var(--text, #1a1d23); font-size: var(--font-size-xs, 12px); outline: none;
         }
         .side-search:focus { border-color: var(--accent, #0e7c6b); box-shadow: 0 0 0 3px var(--focus-ring, rgba(14,124,107,.35)); }
+        /* 侧栏搜索框（文件树与工具栏之间）：wrap 用 margin 不占内边距，× 清除按钮（absolute right:3px）才能落在输入框内 */
+        .side .search-wrap { flex: none; margin: 4px 6px; padding: 0; }
+        .side .side-search { padding-right: 26px; } /* 给 × 按钮留位，输入文字不压按钮 */
+        /* 全文搜索结果列表（搜索时替换文件树） */
+        .search-results { flex: 1; min-height: 0; overflow-y: auto; padding: 4px; }
+        .search-results[hidden] { display: none; }
+        .sr-item { display: block; padding: 5px var(--space-2, 8px); border-radius: var(--radius-base, 6px); cursor: pointer; font-size: var(--font-size-sm, 13px); color: var(--text, #1a1d23); white-space: nowrap; overflow: hidden; }
+        .sr-item:hover { background: var(--surface, #fff); }
+        .sr-item .sr-title { display: block; overflow: hidden; text-overflow: ellipsis; }
+        .sr-item .sr-title mark { background: var(--accent, #0e7c6b); color: var(--accent-text, #fff); border-radius: 2px; padding: 0 1px; }
+        .sr-item .sr-crumb { display: block; font-size: 11px; color: var(--text-muted, #5b6370); overflow: hidden; text-overflow: ellipsis; }
+        .sr-empty { padding: var(--space-3, 12px); font-size: var(--font-size-sm, 13px); color: var(--text-muted, #5b6370); }
+        .search-status { flex: none; padding: 3px 8px; font-size: 11px; color: var(--text-muted, #5b6370); }
+        .side.collapsed .search-wrap, .side.collapsed .search-results, .side.collapsed .search-status { display: none; }
         .search-clear {
           position: absolute; top: 50%; right: 3px; transform: translateY(-50%);
           width: 18px; height: 18px; display: none; align-items: center; justify-content: center;
@@ -49,14 +67,17 @@ export const SHELL_CSS = `
         }
         .search-clear:hover { background: var(--text-muted, #5b6370); }
         .search-clear svg { width: 10px; height: 10px; }
-        .search-clear.show { display: inline-flex; }
-        .tree { flex: 1; overflow-y: auto; padding: 4px; }
+        /* 有输入数据(.show)且鼠标悬停/聚焦输入框时才显示 */
+        .search-wrap:hover .search-clear.show, .search-wrap:focus-within .search-clear.show { display: inline-flex; }
+        .tree { flex: 1; overflow-y: auto; padding: 0; }
         .t-row {
           display: flex; align-items: center; gap: var(--space-1, 4px);
-          padding: 4px var(--space-1, 4px); border-radius: var(--radius-base, 6px);
+          height: 26px; padding: 0 var(--space-1, 4px); border-radius: var(--radius-base, 6px);
           cursor: pointer; font-size: var(--font-size-sm, 13px); color: var(--text, #1a1d23);
-          white-space: nowrap; user-select: none;
+          white-space: nowrap; user-select: none; flex: none; overflow: hidden;
         }
+        /* 虚拟化占位块（撑起未渲染区高度，与 ROW_H=26 对齐） */
+        .tree-spacer { flex: none; }
         .t-row:hover { background: var(--surface, #fff); }
         .t-row.sel { background: var(--surface, #fff); box-shadow: inset 2px 0 0 var(--accent, #0e7c6b); }
         .t-row .caret { flex: none; width: 14px; text-align: center; color: var(--text-muted, #5b6370); font-size: 10px; }
@@ -156,10 +177,12 @@ export const SHELL_CSS = `
         .card-body { flex: 1; min-height: 0; display: flex; }
         .card-editor { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
         .card-nav { flex: none; width: 220px; min-width: 0; border-left: 1px solid var(--border, #d9dce2); background: var(--surface-2, #eceef1); display: flex; flex-direction: column; min-height: 0; }
-        .card-nav-toolbar { display: flex; align-items: center; gap: var(--space-1, 4px); padding: var(--space-2, 8px); border-bottom: 1px solid var(--border, #d9dce2); }
-        .card-nav-search { flex: 1; width: 100%; height: 24px; padding: 0 var(--space-2, 8px); border: 1px solid var(--border, #d9dce2); border-radius: var(--radius-pill, 999px); background: var(--surface, #fff); color: var(--text, #1a1d23); font-size: var(--font-size-xs, 12px); outline: none; }
+        .card-nav-toolbar { position: relative; display: flex; align-items: center; gap: var(--space-1, 4px); padding: var(--space-2, 8px); border-bottom: 1px solid var(--border, #d9dce2); }
+        .card-nav-search { flex: 1; width: 100%; height: 24px; padding: 0 var(--space-2, 8px); padding-right: 26px; border: 1px solid var(--border, #d9dce2); border-radius: var(--radius-pill, 999px); background: var(--surface, #fff); color: var(--text, #1a1d23); font-size: var(--font-size-xs, 12px); outline: none; }
         .card-nav-search:focus { border-color: var(--accent, #0e7c6b); box-shadow: 0 0 0 2px var(--focus-ring, rgba(14,124,107,.35)); }
-        .card-nav-clear { flex: none; width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; border: none; border-radius: 50%; background: var(--border-strong, #b6bcc7); color: var(--surface, #fff); cursor: pointer; padding: 0; font-size: 11px; line-height: 1; }
+        /* 清除按钮：叠于输入框内部右缘；有输入数据(.show)且鼠标悬停/聚焦输入框时才显示 */
+        .card-nav-clear { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); width: 18px; height: 18px; display: none; align-items: center; justify-content: center; border: none; border-radius: 50%; background: var(--border-strong, #b6bcc7); color: var(--surface, #fff); cursor: pointer; padding: 0; font-size: 11px; line-height: 1; }
+        .card-nav-toolbar:hover .card-nav-clear.show, .card-nav-toolbar:focus-within .card-nav-clear.show { display: inline-flex; }
         .card-nav-clear:hover { background: var(--text-muted, #5b6370); }
         .card-nav-outline { flex: 1; overflow-y: auto; padding: var(--space-2, 8px); }
         .card-nav-outline mark { background: #ffd54d; color: #3a2d00; border-radius: 2px; padding: 0 1px; font-weight: 600; }
@@ -287,4 +310,21 @@ export const SHELL_CSS = `
         .btn:focus-visible { outline: 2px solid var(--focus-ring, rgba(14,124,107,.35)); outline-offset: 1px; }
         ::-webkit-scrollbar { width: 8px; height: 8px; }
         ::-webkit-scrollbar-thumb { background: var(--border-strong, #b6bcc7); border-radius: var(--radius-pill, 999px); }
+        /* P2 语法扩展样式 */
+        .preview .footnotes { margin-top: 2em; font-size: 12px; color: var(--text-muted, #5b6370); }
+        .preview .footnotes ol { padding-left: 1.6em; }
+        .preview .footnotes li { margin: .3em 0; }
+        .preview .fn-ref { font-size: 10px; }
+        .preview .fn-back { text-decoration: none; margin-left: .3em; }
+        .preview dl { margin: .6em 0; }
+        .preview dt { font-weight: 600; margin-top: .4em; }
+        .preview dd { margin: 0 0 .3em 1.6em; }
+        .preview .math-inline { white-space: nowrap; }
+        .preview .math-block { text-align: center; margin: .8em 0; overflow-x: auto; }
+        .preview .mermaid { margin: .8em 0; text-align: center; }
+        .preview pre.mermaid-src { background: var(--surface-2, #eceef1); padding: var(--space-3, 12px); border-radius: var(--radius-base, 6px); overflow-x: auto; }
+        .preview details { margin: .6em 0; padding: .4em .8em; border: 1px solid var(--border, #d9dce2); border-radius: var(--radius-base, 6px); }
+        .preview summary { cursor: pointer; font-weight: 600; }
+        ${hljsTheme}
+        ${katexCss}
 `

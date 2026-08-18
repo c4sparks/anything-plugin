@@ -52,7 +52,9 @@ class LivePreviewPlugin {
   }
 
   update(update: ViewUpdate): void {
-    if (update.docChanged || update.viewportChanged) this.decorations = this.build(update.view)
+    // 只在文档变化时重建（滚动不重建，避免视口变化触发全树 tree.iterate 长任务）；
+    // lezer 已按视口惰性解析，单篇通常几十 KB，本阶段不做 RangeSet 局部增量。
+    if (update.docChanged) this.decorations = this.build(update.view)
   }
 
   build(view: EditorView): DecorationSet {

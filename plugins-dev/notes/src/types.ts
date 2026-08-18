@@ -51,6 +51,10 @@ export interface PaneRecord {
   saveTimer: ReturnType<typeof setTimeout> | null
   liveCompartment: Compartment | null
   live: boolean
+  /** 磁盘已确认快照：与编辑器内容一致则跳过写盘（脏检查，未修改不写） */
+  lastSavedText: string | null
+  /** 预览渲染缓存：text=文档原文，html=marked+DOMPurify 结果；内容未变时只注入缓存，不重跑解析 */
+  previewCache: { text: string; html: string } | null
 }
 
 /** 卡片（分屏单元）：自带标签栏 + 路径栏 + 编辑器 + 独立导航（搜索+大纲） */
@@ -60,6 +64,12 @@ export interface CardRecord {
   activePaneId: string | null
   navOpen: boolean
   navQuery: string
+  /** 导航搜索防抖定时器 */
+  navTimer: ReturnType<typeof setTimeout> | null
+  /** 导航刷新门：上次已应用的预览文本（内容未变且查询未变则跳过重建） */
+  outlineCacheText?: string
+  /** 导航刷新门：上次已应用的查询词 */
+  lastNavQuery?: string
   outline: OutlineEntry[]
 }
 

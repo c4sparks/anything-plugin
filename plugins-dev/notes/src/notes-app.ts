@@ -5,11 +5,12 @@ import { Compartment, EditorState, type Transaction } from '@codemirror/state'
 import { placeholder } from '@codemirror/view'
 import { EditorView, basicSetup } from 'codemirror'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
-import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 
 import { editorTheme, Sync } from './editor'
 import { livePreviewExt } from './live-preview'
+import { hydrateMermaid, renderMarkdown } from './markdown'
+import { NoteIndex } from './search'
 import { SHELL_CSS } from './styles'
 import { clearTimer, escapeAttr, escapeHtml, highlightMatch, mustQuery, normalizePath, removeLeaf, targetClosest } from './util'
 import {
@@ -56,6 +57,21 @@ const ROOT = ''
 /** 侧栏折叠为窄条时的宽度（= 折叠/展开按钮宽度） */
 const SIDE_COLLAPSED = 36
 
+/** 文件树虚拟化：固定行高与视口缓冲（须与 styles.ts `.t-row` 高度一致） */
+const ROW_H = 26
+const OVERSAN = 10
+
+/** 文件树虚拟化扁平行（rebuildFlatRows 生成，renderTreeWindow 只渲染可见窗口） */
+interface FlatRow {
+  path: string
+  kind: 'folder' | 'file'
+  depth: number
+  name: string
+  expanded: boolean
+  sel: boolean
+  cur: boolean
+}
+
 const SORT_OPTIONS: SortOption[] = [
   { key: 'name', dir: 1, label: '文件名 升序' },
   { key: 'name', dir: -1, label: '文件名 降序' },
@@ -87,6 +103,15 @@ export class NotesApp extends HTMLElement {
   private previewTimer: ReturnType<typeof setTimeout> | null = null
   private context: ContextState | null = null
   private dialog: DialogState | null = null // {title, mode:'input'|'folder'|'confirm', resolve, message?}
+  // 文件树虚拟化：扁平行模型 + 滚动/渲染 rAF + 目录排序缓存
+  private flatRows: FlatRow[] = []
+  private sortCache = new Map<string, FileEntry[]>()
+  private treeScrollRaf = 0
+  private treeRenderRaf = 0
+  // 全文搜索（MiniSearch 内存索引 + 搜索 UI 状态）
+  private search = new NoteIndex()
+  private searchTimer: ReturnType<typeof setTimeout> | null = null
+  private searchQuery = ''
 
   get activePane(): PaneRecord | null {
     return this.activePaneId ? (this.panes.get(this.activePaneId) ?? null) : null
@@ -112,18 +137,19 @@ export class NotesApp extends HTMLElement {
     this.attachShadow({ mode: 'open' })
     this.renderShell()
     this.bind()
-    this.renderSplit() // 初始无面板：显示全局占位
-    this.updateHead()
+    this.updateHead() // 初始无面板：显示全局占位（含重建）
     void this.loadDir(ROOT)
+    void this.buildFullIndex() // 后台分批建全文索引（不阻塞 UI）
   }
 
   disconnectedCallback(): void {
     clearTimer(this.previewTimer)
+    clearTimer(this.searchTimer)
     for (const rec of this.panes.values()) {
       clearTimer(rec.saveTimer)
-      if (rec.path && rec.editor) {
-        const content = rec.editor.state.doc.toString() // 先捕获内容再写（fire-and-forget）
-        window.api.pluginFiles.write(PLUGIN_ID, rec.path, content).catch(() => {})
+      // 脏检查：未修改不写盘（fire-and-forget）
+      if (rec.path && rec.editor && rec.lastSavedText !== rec.editor.state.doc.toString()) {
+        window.api.pluginFiles.write(PLUGIN_ID, rec.path, rec.editor.state.doc.toString()).catch(() => {})
       }
       rec.editor?.destroy()
     }
@@ -143,7 +169,13 @@ export class NotesApp extends HTMLElement {
             <button class="icon-btn" data-act="expand" title="展开/收起" aria-label="展开收起">${ICON_EXPAND}</button>
             <button type="button" class="icon-btn" data-act="toggle-side" title="折叠左侧" aria-label="折叠左侧">${ICON_PANEL_LEFT}</button>
           </div>
+          <div class="search-wrap">
+            <input class="side-search" data-side-search placeholder="搜索笔记…" spellcheck="false" />
+            <button type="button" class="search-clear" data-search-clear title="清除搜索" aria-label="清除搜索">×</button>
+          </div>
           <div class="tree" data-tree></div>
+          <div class="search-results" data-search-results hidden></div>
+          <div class="search-status" data-search-status hidden></div>
         </aside>
         <div class="splitter" data-splitter title="拖动调整宽度"></div>
         <section class="editor">
@@ -199,10 +231,10 @@ export class NotesApp extends HTMLElement {
         const c = cardId ? this.cards.get(cardId) : undefined
         if (c) {
           c.navQuery = ''
-          this.applyNavHighlight(c)
-          this.renderOutline(c)
+          clearBtn.classList.remove('show')
           const input = cardId ? this.sr.querySelector<HTMLInputElement>(`[data-card-nav-search="${cardId}"]`) : null
           if (input) input.value = ''
+          this.refreshNav(c) // 统一入口：还原高亮 + 重建大纲（含门）
         }
         return
       }
@@ -242,15 +274,18 @@ export class NotesApp extends HTMLElement {
       const paneId = cardId ? this.cards.get(cardId)?.activePaneId : undefined
       if (paneId) this.activatePane(paneId) // 点卡片其它区域 → 聚焦该卡片激活标签
     })
-    // 卡片导航搜索输入：实时过滤该卡片的预览高亮 + 大纲
+    // 卡片导航搜索输入：120ms 防抖 → refreshNav（门控：内容与查询都未变则跳过重建）
     splitRoot.addEventListener('input', (e) => {
       const search = targetClosest<HTMLInputElement>(e, '[data-card-nav-search]')
       if (!search) return
       const c = search.dataset.cardNavSearch ? this.cards.get(search.dataset.cardNavSearch) : undefined
       if (!c) return
       c.navQuery = search.value.trim().toLowerCase()
-      this.applyNavHighlight(c)
-      this.renderOutline(c)
+      // 有输入才显示清除按钮（叠于输入框内右缘）
+      const clear = this.sr.querySelector<HTMLElement>(`[data-card-id="${c.id}"] .card-nav-clear`)
+      clear?.classList.toggle('show', !!c.navQuery)
+      clearTimer(c.navTimer)
+      c.navTimer = setTimeout(() => this.refreshNav(c), 120)
     })
     splitRoot.addEventListener('focusin', (e) => {
       const card = targetClosest<HTMLElement>(e, '[data-card-id]')
@@ -345,6 +380,49 @@ export class NotesApp extends HTMLElement {
       const path = row.dataset.path
       if (path) this.showContext(e, path, row.dataset.kind ?? 'file')
     })
+    // 文件树虚拟化：滚动只重绘可见窗口（rAF 节流）；容器尺寸变化同样重绘
+    const treeEl = mustQuery<HTMLElement>(root, '[data-tree]')
+    treeEl.addEventListener(
+      'scroll',
+      () => {
+        if (this.treeScrollRaf) return
+        this.treeScrollRaf = requestAnimationFrame(() => {
+          this.treeScrollRaf = 0
+          this.renderTreeWindow()
+        })
+      },
+      { passive: true },
+    )
+    new ResizeObserver(() => this.renderTreeWindow()).observe(treeEl)
+    // 全文搜索：输入防抖搜索；Enter 打开首个结果；Escape/清除还原文件树
+    const sideSearch = mustQuery<HTMLInputElement>(root, '[data-side-search]')
+    sideSearch.addEventListener('input', () => {
+      this.searchQuery = sideSearch.value.trim()
+      this.updateSearchClearBtn(!!this.searchQuery)
+      clearTimer(this.searchTimer)
+      if (!this.searchQuery) {
+        this.clearSearch()
+        return
+      }
+      this.searchTimer = setTimeout(() => this.runSearch(false), 200)
+    })
+    sideSearch.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault()
+        this.runSearch(true)
+      } else if (e.key === 'Escape') {
+        this.clearSearch()
+        sideSearch.blur()
+      }
+    })
+    mustQuery(root, '[data-search-clear]').addEventListener('click', () => {
+      this.clearSearch()
+      sideSearch.focus()
+    })
+    mustQuery(root, '[data-search-results]').addEventListener('click', (e) => {
+      const item = targetClosest<HTMLElement>(e, '[data-sr-path]')
+      if (item?.dataset.srPath) void this.openNote(item.dataset.srPath)
+    })
     mustQuery(root, '[data-sort-menu]').addEventListener('click', (e) => {
       const item = targetClosest<HTMLElement>(e, '[data-opt]')
       if (!item) return
@@ -352,6 +430,7 @@ export class NotesApp extends HTMLElement {
       if (!opt) return
       this.sortKey = opt.key
       this.sortDir = opt.dir
+      this.sortCache.clear() // 排序键变化 → 全部缓存失效
       this.renderTree()
       this.hideSortMenu()
     })
@@ -395,7 +474,9 @@ export class NotesApp extends HTMLElement {
       const entries = await window.api.pluginFiles.list(PLUGIN_ID, dir === ROOT ? undefined : dir)
       // 防御：主进程契约返回正斜杠路径，这里再归一化一次，避免 Windows 反斜杠破坏 `/` 路径逻辑
       this.tree.set(dir, entries.map((x) => ({ ...x, path: normalizePath(x.path) })))
-      this.renderTree()
+      this.invalidateSort(dir) // 目录内容变化 → 排序缓存失效
+      this.ensureIndexed(entries) // 全文索引增量（后台，mtime 比对）
+      this.renderTree() // 合帧：内部 rAF 合并多次结构变化
     } catch (err) {
       console.error('[notes] loadDir', dir, err)
     }
@@ -418,20 +499,55 @@ export class NotesApp extends HTMLElement {
     return a
   }
 
+  /** 目录排序缓存键：同一 (dir, sortKey, sortDir) 只排序一次（万级文件不重复 localeCompare） */
+  private sortKeyOf(dir: string): string {
+    return dir + '\u0000' + this.sortKey + '\u0000' + this.sortDir
+  }
+
+  getSorted(dir: string): FileEntry[] {
+    const key = this.sortKeyOf(dir)
+    const hit = this.sortCache.get(key)
+    if (hit) return hit
+    const sorted = this.sortEntries(this.tree.get(dir) ?? [])
+    this.sortCache.set(key, sorted)
+    return sorted
+  }
+
+  /** 目录内容变化 → 该目录的排序缓存失效（loadDir 时调用） */
+  invalidateSort(dir: string): void {
+    for (const key of [...this.sortCache.keys()]) {
+      if (key.startsWith(dir + '\u0000')) this.sortCache.delete(key)
+    }
+  }
+
+  /** 文件树渲染入口：rAF 合帧（多次结构变化合并到一帧重绘），内部重建扁平行 + 重绘窗口 */
   renderTree(): void {
-    const tree = mustQuery<HTMLElement>(this.sr, '[data-tree]')
+    if (this.treeRenderRaf) return
+    this.treeRenderRaf = requestAnimationFrame(() => {
+      this.treeRenderRaf = 0
+      this.rebuildFlatRows()
+      this.renderTreeWindow()
+    })
+  }
+
+  /** 从 tree+expanded+filter 重建扁平行模型（过滤时目录匹配带 memo，避免重复递归） */
+  rebuildFlatRows(): void {
     const q = this.filter
-    const lines: string[] = []
+    const rows: FlatRow[] = []
+    const matchMemo = new Map<string, boolean>()
     const fileMatches = (x: FileEntry) => x.name.toLowerCase().includes(q)
     const dirHasMatch = (path: string): boolean => {
-      const entries = this.sortEntries(this.tree.get(path) ?? [])
-      return entries.some((x) => (x.isDirectory ? dirHasMatch(x.path) : fileMatches(x)))
+      const hit = matchMemo.get(path)
+      if (hit !== undefined) return hit
+      const m = this.getSorted(path).some((x) => (x.isDirectory ? dirHasMatch(x.path) : fileMatches(x)))
+      matchMemo.set(path, m)
+      return m
     }
     const walk = (dir: string, depth: number): void => {
-      const entries = this.sortEntries(this.tree.get(dir) ?? [])
+      const entries = this.getSorted(dir)
       for (const x of entries) {
         if (!q) {
-          // 无搜索：正常渲染
+          // 无搜索：全部渲染
         } else if (x.isDirectory) {
           if (!fileMatches(x) && !dirHasMatch(x.path)) continue // 文件夹自身或后代无匹配则隐藏
           if (this.expanded.has(x.path) && !this.tree.has(x.path)) void this.loadDir(x.path) // 保证结果可见
@@ -439,28 +555,57 @@ export class NotesApp extends HTMLElement {
           continue
         }
         const isFolder = x.isDirectory
-        const indent = 'padding-left:' + (depth * 14 + 4) + 'px'
-        const caret = isFolder ? (this.expanded.has(x.path) ? '▾' : '▸') : ''
-        const cls = ['t-row']
-        if (isFolder) cls.push('folder')
-        if (this.selectedItem === x.path) cls.push('sel')
-        if (!isFolder && this.current === x.path) cls.push('cur')
-        lines.push(
-          `<div class="${cls.join(' ')}" style="${indent}" data-path="${escapeAttr(x.path)}" data-kind="${isFolder ? 'folder' : 'file'}" title="${escapeAttr(x.path)}" ${isFolder ? '' : 'draggable="true"'}>
-            <span class="caret">${caret}</span>
-            <span class="ic">${isFolder ? ICON_FOLDER_SM : ICON_DOC_SM}</span>
-            <span class="nm">${highlightMatch(x.name.replace(/\.md$/, ''), q)}</span>
-          </div>`,
-        )
+        rows.push({
+          path: x.path,
+          kind: isFolder ? 'folder' : 'file',
+          depth,
+          name: x.name.replace(/\.md$/, ''),
+          expanded: isFolder && this.expanded.has(x.path),
+          sel: this.selectedItem === x.path,
+          cur: !isFolder && this.current === x.path,
+        })
         if (isFolder && this.expanded.has(x.path)) walk(x.path, depth + 1)
       }
     }
     walk(ROOT, 0)
-    if (!lines.length) {
+    this.flatRows = rows
+  }
+
+  /** 单行 HTML（虚拟化窗口内的行；事件委托 targetClosest('[data-path]') 天然兼容窗口化） */
+  private flatRowHtml(r: FlatRow, q: string): string {
+    const cls = ['t-row']
+    if (r.kind === 'folder') cls.push('folder')
+    if (r.sel) cls.push('sel')
+    if (r.cur) cls.push('cur')
+    const indent = 'padding-left:' + (r.depth * 14 + 4) + 'px'
+    const caret = r.kind === 'folder' ? (r.expanded ? '▾' : '▸') : ''
+    return `<div class="${cls.join(' ')}" style="${indent}" data-path="${escapeAttr(r.path)}" data-kind="${r.kind}" title="${escapeAttr(r.path)}" ${r.kind === 'file' ? 'draggable="true"' : ''}>
+      <span class="caret">${caret}</span>
+      <span class="ic">${r.kind === 'folder' ? ICON_FOLDER_SM : ICON_DOC_SM}</span>
+      <span class="nm">${highlightMatch(r.name, q)}</span>
+    </div>`
+  }
+
+  /** 重绘可见窗口行：scrollTop 映射到行区间，spacer 撑起未渲染区；滚动时 rAF 节流调用 */
+  renderTreeWindow(): void {
+    const tree = mustQuery<HTMLElement>(this.sr, '[data-tree]')
+    const q = this.filter
+    const total = this.flatRows.length
+    if (total === 0) {
       tree.innerHTML = `<div class="t-empty">${q ? '没有匹配项。' : '还没有内容。点上方按钮新建。'}</div>`
       return
     }
-    tree.innerHTML = lines.join('')
+    const viewH = tree.clientHeight || 0
+    // 钳制 scrollTop：行数收缩（折叠/过滤）后防止越界
+    const maxScroll = Math.max(0, total * ROW_H - viewH)
+    if (tree.scrollTop > maxScroll) tree.scrollTop = maxScroll
+    const start = Math.max(0, Math.floor(tree.scrollTop / ROW_H) - OVERSAN)
+    const end = Math.min(total, Math.ceil((tree.scrollTop + viewH) / ROW_H) + OVERSAN)
+    const html: string[] = []
+    if (start > 0) html.push(`<div class="tree-spacer" style="height:${start * ROW_H}px"></div>`)
+    for (let i = start; i < end; i++) html.push(this.flatRowHtml(this.flatRows[i], q))
+    if (end < total) html.push(`<div class="tree-spacer" style="height:${(total - end) * ROW_H}px"></div>`)
+    tree.innerHTML = html.join('')
   }
 
   async selectFolder(path: string): Promise<void> {
@@ -558,13 +703,12 @@ export class NotesApp extends HTMLElement {
       return
     }
     rec.mode = mode
-    const cardEl = rec.cardId ? this.sr.querySelector<HTMLElement>(`[data-card-id="${rec.cardId}"]`) : null
-    if (cardEl) cardEl.dataset.mode = mode
     if (rec.editor && rec.liveCompartment) {
       rec.live = mode === 'normal'
       rec.editor.dispatch({ effects: rec.liveCompartment.reconfigure(rec.live ? livePreviewExt() : []) })
     }
-    if (mode === 'preview') this.renderPreview(paneId)
+    // 统一入口：updateHead() 重建卡片 DOM（data-mode 由 renderCard 从 rec.mode 恢复）+ 刷新各卡片预览。
+    // 注意：预览渲染必须发生在重建之后，否则渲染结果会被整卡重建清空（旧实现顺序相反导致预览空白）。
     this.updateHead()
     this.renderMoreMenu(paneId)
     rec.editor?.focus()
@@ -583,8 +727,7 @@ export class NotesApp extends HTMLElement {
     else this.splitRoot = splitNode
     this.activeCardId = newCard.id
     this.activePaneId = dup.id
-    this.updateHead()
-    this.renderSplit()
+    this.updateHead() // 单次重建 + 刷新（旧卡片预览不再因重建丢失）
     if (active.path) await this.openInPane(dup.id, active.path)
     this.renderMoreMenu()
   }
@@ -686,8 +829,8 @@ export class NotesApp extends HTMLElement {
   toggleNav(cardId?: string | null): void {
     const card = (cardId ? this.cards.get(cardId) : undefined) ?? this.ensureCard()
     card.navOpen = !card.navOpen
-    if (card.navOpen) this.renderPreview(card.activePaneId)
-    this.renderSplit()
+    // 重建（导航栏随 renderCard 显隐）+ 刷新预览/大纲；预览渲染必须在重建之后
+    this.updateHead()
     this.renderMoreMenu()
   }
 
@@ -701,9 +844,22 @@ export class NotesApp extends HTMLElement {
     const preview = rec.cardId ? this.sr.querySelector<HTMLElement>(`[data-card-id="${rec.cardId}"] [data-preview]`) : null
     if (!preview) return
     const content = target.editor?.state.doc.toString() ?? ''
-    const raw = content ? (marked.parse(content, { async: false }) as string) : ''
-    const safe = content ? DOMPurify.sanitize(raw) : ''
-    preview.innerHTML = safe
+    // 内容未变 → 只注入缓存 HTML（renderMarkdown/DOMPurify 不重跑）；缓存键绑 target（实际展示的面板）
+    if (target.previewCache && target.previewCache.text === content) {
+      preview.innerHTML = target.previewCache.html
+    } else {
+      const raw = content ? renderMarkdown(content) : ''
+      // KaTeX 需要 style 属性、MathML 注解标签；其余走 DOMPurify 默认白名单（details/summary 默认放行）
+      const safe = content
+        ? DOMPurify.sanitize(raw, {
+            ADD_ATTR: ['style'],
+            ADD_TAGS: ['annotation', 'semantics', 'mspace', 'mpadded', 'mphantom', 'menclose'],
+          })
+        : ''
+      target.previewCache = { text: content, html: safe }
+      preview.innerHTML = safe
+    }
+    void hydrateMermaid(preview) // 懒加载渲染 ```mermaid（缓存命中重注入后同样触发）
     // 该卡片导航开着 → 应用该卡片自己的搜索高亮 + 重建大纲
     if (card && card.navOpen && target.id === card.activePaneId) {
       this.applyNavHighlight(card)
@@ -711,36 +867,60 @@ export class NotesApp extends HTMLElement {
     }
   }
 
-  /** 在指定卡片的预览上高亮该卡片的搜索词 */
-  applyNavHighlight(card: CardRecord): void {
-    const q = card.navQuery
-    if (!q) return
+  /** 还原导航高亮：把上次的 <mark class="nav-hl"> 恢复为原文文本节点（清空查询后不留残留） */
+  unwrapAllMarks(el: HTMLElement): void {
+    for (const m of [...el.querySelectorAll('mark.nav-hl')]) m.replaceWith(...m.childNodes)
+  }
+
+  /** 导航搜索统一入口（含门）：内容与查询都未变则跳过重建；否则还原旧高亮 + 重新高亮 + 重建大纲 */
+  refreshNav(card: CardRecord): void {
     const target = card.activePaneId ? this.panes.get(card.activePaneId) : undefined
     if (!target) return
     const preview = this.sr.querySelector<HTMLElement>(`[data-card-id="${card.id}"] [data-preview]`)
     if (!preview) return
+    const content = target.editor?.state.doc.toString() ?? ''
+    if (card.outlineCacheText === content && card.lastNavQuery === card.navQuery) return
+    card.outlineCacheText = content
+    card.lastNavQuery = card.navQuery
+    this.applyNavHighlight(card)
+    this.renderOutline(card)
+  }
+
+  /** 在指定卡片的预览上高亮该卡片的搜索词（匹配数封顶 MAX_HL=300，跳过 pre/code/script/style） */
+  applyNavHighlight(card: CardRecord): void {
+    const preview = this.sr.querySelector<HTMLElement>(`[data-card-id="${card.id}"] [data-preview]`)
+    if (!preview) return
+    this.unwrapAllMarks(preview) // 先还原上次高亮，避免查询清空/变化后 <mark> 残留
+    const q = card.navQuery
+    if (!q) return
+    const target = card.activePaneId ? this.panes.get(card.activePaneId) : undefined
+    if (!target) return
     const walker = document.createTreeWalker(preview, NodeFilter.SHOW_TEXT)
     const targets: Text[] = []
     while (walker.nextNode()) {
       const node = walker.currentNode
       if (node.nodeType !== Node.TEXT_NODE) continue
-      if (node.parentElement?.closest('pre, code, script, style')) continue
+      if (node.parentElement?.closest('pre, code, script, style, .katex')) continue // 代码/数学公式不高亮
       targets.push(node as Text)
     }
+    const MAX_HL = 300 // 高亮匹配数封顶：超长文档不卡
+    let hl = 0
     for (const node of targets) {
+      if (hl >= MAX_HL) break
       const text = node.textContent ?? ''
       const lower = text.toLowerCase()
       let idx = lower.indexOf(q)
       if (idx === -1) continue
       const frag = document.createDocumentFragment()
       let i = 0
-      while (idx !== -1) {
+      while (idx !== -1 && hl < MAX_HL) {
         if (idx > i) frag.appendChild(document.createTextNode(text.slice(i, idx)))
         const mark = document.createElement('mark')
         mark.className = 'nav-hl'
         mark.textContent = text.slice(idx, idx + q.length)
         frag.appendChild(mark)
         i = idx + q.length
+        hl++
         idx = lower.indexOf(q, i)
       }
       if (i < text.length) frag.appendChild(document.createTextNode(text.slice(i)))
@@ -832,7 +1012,6 @@ export class NotesApp extends HTMLElement {
       this.activeCardId = card.id
       this.activePaneId = tab.id
       this.updateHead()
-      this.renderSplit()
       await this.openInPane(tab.id, rel)
     } catch (err) {
       console.error('[notes] 新建失败（可能已存在）', err)
@@ -854,7 +1033,6 @@ export class NotesApp extends HTMLElement {
     this.activeCardId = card.id
     this.activePaneId = tab.id
     this.updateHead()
-    this.renderSplit()
     await this.openInPane(tab.id, path)
   }
 
@@ -877,18 +1055,33 @@ export class NotesApp extends HTMLElement {
     this.activeCardId = card.id
     this.activePaneId = tab.id
     this.updateHead()
-    this.renderSplit()
     await this.openInPane(tab.id, path)
   }
 
   // ---------- 多开拆分面板 ----------
   updatePaneTitle(_paneId: string): void {
-    this.renderSplit() // 卡片标签/路径随重渲染刷新（重命名/移动/换笔记时）
+    this.updateHead() // 卡片标签/路径随重渲染刷新（重命名/移动/换笔记时）；统一入口含预览刷新
   }
 
-  /** 重渲染卡片（标签栏/路径栏都在卡片内） */
+  /** 重渲染卡片（标签栏/路径栏都在卡片内）；统一入口 = 重建 DOM + 刷新各卡片预览。
+   * 所有会重建卡片 DOM 的调用点都应走这里（而非裸 renderSplit），否则预览/导航内容会被清空。 */
   updateHead(): void {
     this.renderSplit()
+    this.refreshAllPreviews()
+  }
+
+  /** 重建后按需重刷预览：仅对可见卡片中「预览模式或导航打开」的激活标签重渲染（含大纲/搜索高亮） */
+  refreshAllPreviews(): void {
+    const ids = this.splitCardIds()
+    if (ids.size === 0) {
+      const card = this.activeCard
+      if (card) ids.add(card.id)
+    }
+    for (const id of ids) {
+      const card = this.cards.get(id)
+      const rec = card?.activePaneId ? this.panes.get(card.activePaneId) : undefined
+      if (rec && (rec.mode === 'preview' || card?.navOpen)) this.renderPreview(rec.id)
+    }
   }
 
   /** 渲染 .main：普通态只显示激活卡片；分屏态渲染分屏树 */
@@ -980,7 +1173,7 @@ export class NotesApp extends HTMLElement {
       const nav = document.createElement('div')
       nav.className = 'card-nav'
       nav.innerHTML =
-        `<div class="card-nav-toolbar"><input class="card-nav-search" data-card-nav-search="${card.id}" value="${escapeAttr(card.navQuery)}" placeholder="搜索…" spellcheck="false" /><button type="button" class="card-nav-clear" data-card-nav-clear="${card.id}" title="清除搜索" aria-label="清除搜索">×</button></div>` +
+        `<div class="card-nav-toolbar"><input class="card-nav-search" data-card-nav-search="${card.id}" value="${escapeAttr(card.navQuery)}" placeholder="搜索…" spellcheck="false" /><button type="button" class="card-nav-clear${card.navQuery ? ' show' : ''}" data-card-nav-clear="${card.id}" title="清除搜索" aria-label="清除搜索">×</button></div>` +
         `<div class="card-nav-outline" data-card-nav-outline="${card.id}"></div>`
       body.appendChild(nav)
     }
@@ -1008,14 +1201,14 @@ export class NotesApp extends HTMLElement {
   }
 
   createPane(): PaneRecord {
-    const rec: PaneRecord = { id: 'pane-' + this.nextPaneId++, cardId: null, path: null, mode: 'normal', editor: null, saveTimer: null, liveCompartment: null, live: false }
+    const rec: PaneRecord = { id: 'pane-' + this.nextPaneId++, cardId: null, path: null, mode: 'normal', editor: null, saveTimer: null, liveCompartment: null, live: false, lastSavedText: null, previewCache: null }
     this.panes.set(rec.id, rec)
     return rec
   }
 
   /** 新建一张分屏卡片（含独立标签栏） */
   createCard(): CardRecord {
-    const card: CardRecord = { id: 'card-' + this.nextCardId++, paneIds: [], activePaneId: null, navOpen: false, navQuery: '', outline: [] }
+    const card: CardRecord = { id: 'card-' + this.nextCardId++, paneIds: [], activePaneId: null, navOpen: false, navQuery: '', navTimer: null, outline: [] }
     this.cards.set(card.id, card)
     return card
   }
@@ -1065,7 +1258,7 @@ export class NotesApp extends HTMLElement {
     clearTimer(rec.saveTimer)
     if (!discard && rec.path && rec.editor) {
       try {
-        await window.api.pluginFiles.write(PLUGIN_ID, rec.path, rec.editor.state.doc.toString())
+        await this.writeIfDirty(rec) // 脏检查：未修改不写盘
       } catch {
         /* 落盘失败忽略 */
       }
@@ -1077,6 +1270,7 @@ export class NotesApp extends HTMLElement {
       card.paneIds = card.paneIds.filter((id) => id !== paneId)
       if (card.paneIds.length === 0) {
         // 卡片已空 → 删除卡片；分屏树就地折叠；只剩单卡片 → 回到单卡片模式
+        clearTimer(card.navTimer)
         this.cards.delete(card.id)
         if (this.splitRoot) {
           const collapsed = removeLeaf(this.splitRoot, card.id)
@@ -1097,17 +1291,13 @@ export class NotesApp extends HTMLElement {
       this.activePaneId = null
       this.activeCardId = null
       this.splitRoot = null
-      this.renderSplit()
-      this.updateHead()
+      this.updateHead() // 占位渲染（无卡片可刷预览）
       this.renderTree()
-      this.renderPreview()
       return
     }
-    this.renderSplit()
-    this.updateHead()
+    this.updateHead() // 重建 + 刷新剩余卡片的预览
     this.activePane?.editor?.focus()
     this.renderTree()
-    this.renderPreview()
   }
 
   /** 打开 path 到指定标签（替换其内容），并设为该卡片激活标签 */
@@ -1131,12 +1321,13 @@ export class NotesApp extends HTMLElement {
     rec.path = path
     this.selectedItem = path
     const host = rec.cardId ? this.sr.querySelector<HTMLElement>(`[data-card-id="${rec.cardId}"] [data-editor]`) : null
-    if (!host) this.renderSplit() // 卡片 DOM 缺失（理论不发生）则补渲染
+    if (!host) this.updateHead() // 卡片 DOM 缺失（理论不发生）则补渲染（统一入口，预览不丢失）
     this.createEditorForPane(paneId, content)
+    rec.lastSavedText = content // 读入即快照：未编辑不写回
+    this.indexFromOpen(path, content) // 全文索引增量
     if (paneId === this.activePaneId) {
-      this.updateHead()
+      this.updateHead() // 重建 + 刷新预览（预览/导航模式由 refreshAllPreviews 覆盖）
       this.renderTree()
-      this.renderPreview(paneId)
     }
     rec.editor?.focus()
   }
@@ -1168,10 +1359,8 @@ export class NotesApp extends HTMLElement {
       card.activePaneId = paneId
       this.activeCardId = card.id
     }
-    this.updateHead()
-    this.renderSplit()
+    this.updateHead() // 重建 + 刷新预览（激活标签的预览/导航内容由 refreshAllPreviews 覆盖）
     this.renderTree()
-    this.renderPreview(paneId)
     this.panes.get(paneId)?.editor?.focus()
   }
 
@@ -1213,6 +1402,7 @@ export class NotesApp extends HTMLElement {
             // 外部同步来的改动（其他分屏面板的编辑）：不转发、不由本面板落盘
             const external = u.transactions.some((tr) => tr.annotation(Sync))
             if (external) {
+              rec.lastSavedText = u.state.doc.toString() // 外部同步：快照跟随（源面板负责落盘）
               if (this.needsLivePreview(rec)) this.schedulePreviewPane(paneId)
               return
             }
@@ -1261,16 +1451,25 @@ export class NotesApp extends HTMLElement {
     }, 300)
   }
 
+  /** 脏检查写盘：内容与磁盘快照一致则跳过 IPC；写成功后更新快照并同步全文索引 */
+  async writeIfDirty(rec: PaneRecord): Promise<void> {
+    if (!rec.path || !rec.editor) return
+    const text = rec.editor.state.doc.toString()
+    if (rec.lastSavedText === text) return
+    try {
+      await window.api.pluginFiles.write(PLUGIN_ID, rec.path, text)
+      rec.lastSavedText = text
+      this.indexFromSave(rec.path, text)
+    } catch (err) {
+      console.error('[notes] 保存失败', err)
+    }
+  }
+
   async savePane(paneId: string): Promise<void> {
     const rec = this.panes.get(paneId)
     if (!rec) return
     clearTimer(rec.saveTimer) // 取消防抖定时器：避免删除/切换后旧定时器把文件写回
-    if (!rec.path || !rec.editor) return
-    try {
-      await window.api.pluginFiles.write(PLUGIN_ID, rec.path, rec.editor.state.doc.toString())
-    } catch (err) {
-      console.error('[notes] 保存失败', err)
-    }
+    await this.writeIfDirty(rec)
   }
 
   saveAll(): Promise<void[]> {
@@ -1280,6 +1479,129 @@ export class NotesApp extends HTMLElement {
   /** 兼容旧调用点：保存激活面板 */
   saveCurrent(): Promise<void> {
     return this.activePaneId ? this.savePane(this.activePaneId) : Promise.resolve()
+  }
+
+  // ---------- 全文搜索 ----------
+  /** 后台全量建索引：BFS 收集所有 .md（复用树缓存，未加载目录按需 list），分批读取+索引让出主线程 */
+  async buildFullIndex(): Promise<void> {
+    const pending: Array<{ path: string; mtimeMs?: number }> = []
+    const visited = new Set<string>()
+    const queue = [ROOT]
+    while (queue.length) {
+      const dir = queue.shift()!
+      if (visited.has(dir)) continue
+      visited.add(dir)
+      let entries: FileEntry[]
+      try {
+        entries = this.tree.has(dir)
+          ? this.tree.get(dir)!
+          : await window.api.pluginFiles.list(PLUGIN_ID, dir === ROOT ? undefined : dir)
+        this.tree.set(dir, entries.map((x) => ({ ...x, path: normalizePath(x.path) })))
+      } catch {
+        continue
+      }
+      for (const x of entries) {
+        if (x.isDirectory) queue.push(x.path)
+        else if (x.path.toLowerCase().endsWith('.md')) pending.push({ path: x.path, mtimeMs: x.mtimeMs })
+      }
+      this.renderTree()
+    }
+    const BATCH = 20 // 每批 20 篇，批间 setTimeout(0) 让出主线程，UI 不卡
+    for (let i = 0; i < pending.length; i += BATCH) {
+      const chunk = pending.slice(i, i + BATCH)
+      this.search.pending = pending.length - i
+      this.updateSearchStatus()
+      await Promise.all(
+        chunk.map(async (f) => {
+          try {
+            const content = await window.api.pluginFiles.read(PLUGIN_ID, f.path)
+            this.search.upsertIfChanged(f.path, content, f.mtimeMs)
+          } catch {
+            /* 读取失败跳过 */
+          }
+        }),
+      )
+      await new Promise((r) => setTimeout(r, 0))
+    }
+    this.search.pending = 0
+    this.updateSearchStatus()
+  }
+
+  /** loadDir 后增量：新文件/变更文件（mtimeMs 变化）后台读取并入索引 */
+  private ensureIndexed(entries: FileEntry[]): void {
+    for (const x of entries) {
+      if (x.isDirectory || !x.path.toLowerCase().endsWith('.md')) continue
+      if (this.search.has(x.path) && this.search.mtime(x.path) === x.mtimeMs) continue
+      void window.api.pluginFiles
+        .read(PLUGIN_ID, x.path)
+        .then((content) => this.search.upsertIfChanged(x.path, content, x.mtimeMs))
+        .catch(() => {})
+    }
+  }
+
+  /** 打开笔记后入索引（幂等：同 id 覆盖） */
+  private indexFromOpen(path: string, content: string): void {
+    this.search.add(path, content)
+  }
+
+  /** 保存成功后同步索引 */
+  private indexFromSave(path: string, text: string): void {
+    this.search.add(path, text)
+  }
+
+  /** 搜索：结果替换文件树展示（上限 100），点击/Enter 打开 */
+  runSearch(openFirst = false): void {
+    const q = this.searchQuery
+    const box = mustQuery<HTMLElement>(this.sr, '[data-search-results]')
+    const tree = mustQuery<HTMLElement>(this.sr, '[data-tree]')
+    if (!q) return
+    const results = this.search.search(q, 100)
+    if (openFirst && results.length) {
+      void this.openNote(results[0].path)
+      return
+    }
+    tree.style.display = 'none'
+    box.hidden = false
+    box.innerHTML = results.length
+      ? results
+          .map((r) => {
+            const crumb = r.path.includes('/') ? r.path.slice(0, r.path.lastIndexOf('/')) : ''
+            return `<div class="sr-item" data-sr-path="${escapeAttr(r.path)}"><span class="sr-title">${highlightMatch(r.title, q)}</span>${crumb ? `<span class="sr-crumb">${escapeHtml(crumb)}</span>` : ''}</div>`
+          })
+          .join('')
+      : '<div class="sr-empty">没有匹配的笔记。</div>'
+  }
+
+  /** 清空搜索：还原文件树 */
+  clearSearch(): void {
+    this.searchQuery = ''
+    clearTimer(this.searchTimer)
+    this.updateSearchClearBtn(false)
+    const box = mustQuery<HTMLElement>(this.sr, '[data-search-results]')
+    const tree = mustQuery<HTMLElement>(this.sr, '[data-tree]')
+    const input = mustQuery<HTMLInputElement>(this.sr, '[data-side-search]')
+    input.value = ''
+    box.hidden = true
+    box.innerHTML = ''
+    tree.style.display = ''
+    this.renderTree()
+  }
+
+  /** 搜索清除按钮显隐（有输入才显示 ×） */
+  private updateSearchClearBtn(show: boolean): void {
+    this.sr.querySelector<HTMLElement>('[data-search-clear]')?.classList.toggle('show', show)
+  }
+
+  /** 索引状态角标（后台建索引期间显示「索引中 (N)」） */
+  private updateSearchStatus(): void {
+    const el = this.sr.querySelector<HTMLElement>('[data-search-status]')
+    if (!el) return
+    if (this.search.pending > 0) {
+      el.hidden = false
+      el.textContent = `索引中 (${this.search.pending})`
+    } else {
+      el.hidden = true
+    }
   }
 
   // ---------- 排序 ----------
@@ -1343,6 +1665,7 @@ export class NotesApp extends HTMLElement {
         console.error('[notes] 删除失败', err)
         return
       }
+      this.search.remove(path) // 索引同步（含后代）
       try {
         // 关闭所有打开该路径/其后代的面板（discard 防写回）
         for (const [id, rec] of [...this.panes]) {
@@ -1381,6 +1704,7 @@ export class NotesApp extends HTMLElement {
       if (newPath === path) return
       try {
         await window.api.pluginFiles.move(PLUGIN_ID, path, newPath)
+        this.search.rename(path, newPath) // 索引同步（含后代）
         // 打开该路径/后代的面板：重写路径前缀并刷新标题
         for (const rec of this.panes.values()) {
           if (rec.path && (rec.path === path || rec.path.startsWith(path + '/'))) {
@@ -1414,6 +1738,7 @@ export class NotesApp extends HTMLElement {
     const newPath = (parent ? parent + '/' : '') + bare + (isMd ? '.md' : '')
     try {
       await window.api.pluginFiles.move(PLUGIN_ID, path, newPath)
+      this.search.rename(path, newPath) // 索引同步（含后代）
       // 打开该路径/后代的面板：重写路径前缀并刷新标题
       for (const rec of this.panes.values()) {
         if (rec.path && (rec.path === path || rec.path.startsWith(path + '/'))) {
@@ -1450,9 +1775,9 @@ export class NotesApp extends HTMLElement {
   resetEditor(): void {
     for (const rec of this.panes.values()) {
       clearTimer(rec.saveTimer)
-      if (rec.path && rec.editor) {
-        const content = rec.editor.state.doc.toString() // 先捕获内容再写（fire-and-forget）
-        window.api.pluginFiles.write(PLUGIN_ID, rec.path, content).catch(() => {})
+      // 脏检查：未修改不写盘（fire-and-forget）
+      if (rec.path && rec.editor && rec.lastSavedText !== rec.editor.state.doc.toString()) {
+        window.api.pluginFiles.write(PLUGIN_ID, rec.path, rec.editor.state.doc.toString()).catch(() => {})
       }
       rec.editor?.destroy()
     }
@@ -1464,8 +1789,7 @@ export class NotesApp extends HTMLElement {
     this.lastActivePaneId = null
     this.filter = ''
     clearTimer(this.previewTimer)
-    this.renderSplit() // 回全局占位
-    this.updateHead()
+    this.updateHead() // 回全局占位（含重建）
     const editor = mustQuery<HTMLElement>(this.sr, '.editor')
     editor.classList.remove('mode-normal', 'mode-source', 'mode-preview', 'mode-split', 'mode-split-v')
     editor.classList.add('mode-normal')
