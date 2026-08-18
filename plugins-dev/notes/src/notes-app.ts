@@ -86,6 +86,10 @@ export class NotesApp extends HTMLElement {
   private expanded = new Set<string>()
   private selectedFolder: string = ROOT // 新文件/夹落点
   private selectedItem: string | null = null // 树中选中项（文件/夹 path）
+  /** 树多选：Shift 连选 / Ctrl(Cmd) 切换 的附加选中集（不含 selectedItem 主选中） */
+  private multiSel = new Set<string>()
+  /** Shift 连选锚点行 path */
+  private selAnchor: string | null = null
   private panes = new Map<string, PaneRecord>() // paneId -> 面板（标签）记录
   private cards = new Map<string, CardRecord>() // cardId -> 卡片（分屏单元）记录
   private splitRoot: SplitTree | null = null // null=单卡片 | {type:'split',dir,children:[leaf,leaf]}（叶子为 cardId）
@@ -102,6 +106,8 @@ export class NotesApp extends HTMLElement {
   private morePaneId: string | null = null // 更多菜单当前作用的面板 id
   private previewTimer: ReturnType<typeof setTimeout> | null = null
   private context: ContextState | null = null
+  /** 编辑区右键菜单作用的面板 id */
+  private editMenuPaneId: string | null = null
   private dialog: DialogState | null = null // {title, mode:'input'|'folder'|'confirm', resolve, message?}
   // 文件树虚拟化：扁平行模型 + 滚动/渲染 rAF + 目录排序缓存
   private flatRows: FlatRow[] = []
@@ -187,6 +193,7 @@ export class NotesApp extends HTMLElement {
         <div class="menu" data-more-menu style="min-width:150px"></div>
         <div class="drag-hint" data-drag-hint></div>
         <div class="ctx" data-ctx></div>
+        <div class="edit-menu" data-edit-menu></div>
         <div class="overlay" data-overlay>
           <div class="modal">
             <h4 class="modal-title" data-modal-title></h4>
@@ -220,8 +227,24 @@ export class NotesApp extends HTMLElement {
     })
     mustQuery(root, '[data-splitter]').addEventListener('mousedown', (e) => this.startSplitDrag(e))
     const splitRoot = mustQuery<HTMLElement>(root, '[data-split-root]')
-    // 卡片内事件委托：标签切换/关闭、新建、更多、点击聚焦、拖拽（标签栏=多开，内容=插链接）、导航（搜索/清除/大纲）
+    // 卡片内事件委托：标签切换/关闭、新建、更多、点击聚焦、拖拽（标签栏=多开，内容=插链接）、导航（搜索/清除/大纲）、预览链接
     splitRoot.addEventListener('click', (e) => {
+      // 目标可能是文本节点（预览渲染文本/编辑器文本）：统一取元素再判定
+      const t = e.target
+      const el = t instanceof Element ? t : t instanceof Text ? t.parentElement : null
+      // 预览区链接：内部笔记路径 → 打开笔记；https 等外部 → 系统浏览器（宿主 windowOpenHandler）；#锚点 → 滚动到标题
+      const plink = el ? el.closest<HTMLAnchorElement>('.preview a[href]') : null
+      if (plink) {
+        e.preventDefault()
+        e.stopPropagation()
+        const href = plink.getAttribute('href') ?? ''
+        if (href.startsWith('#')) {
+          this.sr.getElementById(href.slice(1))?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+          return
+        }
+        this.handleLinkClick(href)
+        return
+      }
       const card = targetClosest<HTMLElement>(e, '[data-card-id]')
       if (!card) return
       const cardId = card.dataset.cardId
@@ -299,6 +322,43 @@ export class NotesApp extends HTMLElement {
       e.preventDefault()
       this.startDividerDrag(e, divider)
     })
+    // 编辑区右键菜单：作用于该卡片激活标签的编辑器（新增链接/文本格式/段落设置/插入/剪贴板）
+    // 捕获阶段 + 兼容文本节点目标：预览渲染的纯文本/编辑器内文本节点右键时 e.target 是 Text，
+    // 若按 Element 判断会漏判导致菜单不出现（普通/预览/源文件三种模式均须可用）
+    splitRoot.addEventListener(
+      'contextmenu',
+      (e) => {
+        const t = e.target
+        const targetEl = t instanceof Element ? t : t instanceof Text ? t.parentElement : null
+        if (!targetEl) return
+        if (!targetEl.closest('.card-editor')) return // 仅编辑器列（含预览）
+        const card = targetEl.closest<HTMLElement>('[data-card-id]')
+        if (!card?.dataset.cardId) return
+        const paneId = this.cards.get(card.dataset.cardId)?.activePaneId
+        const rec = paneId ? this.panes.get(paneId) : undefined
+        if (!paneId || !rec?.editor) return
+        // 预览模式：编辑器隐藏，不需要编辑右键菜单（不拦截，走浏览器原生菜单，便于复制预览文本）
+        if (rec.mode === 'preview') return
+        e.preventDefault()
+        e.stopPropagation()
+        // 右键时若无可编辑选区，自动选中光标下的词（便于直接复制/剪切；编辑器可见时才定位）
+        const view = rec.editor
+        const pos = view.posAtCoords({ x: e.clientX, y: e.clientY })
+        if (pos != null && view.state.selection.main.empty) {
+          const line = view.state.doc.lineAt(pos)
+          const text = line.text
+          const rel = Math.max(0, Math.min(pos - line.from, text.length))
+          const isWord = (c: string) => /[\w\u4e00-\u9fff]/.test(c)
+          let s = rel
+          let t = rel
+          while (s > 0 && isWord(text[s - 1])) s--
+          while (t < text.length && isWord(text[t])) t++
+          if (s < t) view.dispatch({ selection: { anchor: line.from + s, head: line.from + t } })
+        }
+        this.showEditMenu(e, paneId)
+      },
+      { capture: true },
+    )
     // capture：抢在 CodeMirror 自身的 drop/dragover 之前处理，避免编辑器把路径当文本插入
     splitRoot.addEventListener(
       'dragover',
@@ -362,11 +422,30 @@ export class NotesApp extends HTMLElement {
     mustQuery(root, '[data-tree]').addEventListener('click', (e) => {
       const row = targetClosest<HTMLElement>(e, '[data-path]')
       if (!row) {
-        this.selectFolder(ROOT) // 点击文件树空白处 = 回到根
+        // 点击文件树空白处 = 回到根，并清空多选
+        this.multiSel.clear()
+        this.selAnchor = null
+        this.selectFolder(ROOT)
         return
       }
       const path = row.dataset.path
+      if (!path) return
       const kind = row.dataset.kind
+      if (e.shiftKey) {
+        // Shift+点击：从锚点行到当前行连续多选（文件/文件夹均可），不触发打开/展开
+        e.preventDefault()
+        this.rangeSelect(path)
+        return
+      }
+      if (e.ctrlKey || e.metaKey) {
+        // Ctrl/Cmd+点击：切换该行加入/移出多选，不触发打开/展开
+        e.preventDefault()
+        this.toggleSelect(path)
+        return
+      }
+      // 普通点击：清空多选，保持原有行为（文件打开 / 文件夹展开收起）
+      this.multiSel.clear()
+      this.selAnchor = null
       if (kind === 'folder') {
         if (path) this.selectFolder(path)
       } else if (path) {
@@ -378,7 +457,19 @@ export class NotesApp extends HTMLElement {
       if (!row || row.dataset.kind === 'root') return
       e.preventDefault()
       const path = row.dataset.path
-      if (path) this.showContext(e, path, row.dataset.kind ?? 'file')
+      if (!path) return
+      const kind = row.dataset.kind ?? 'file'
+      // 右键落在当前选中集内 → 对整个选中集操作；否则重置为单行选中
+      const paths = this.effectiveSelection()
+      if (paths.includes(path)) {
+        this.showContext(e, path, kind, paths)
+      } else {
+        this.multiSel.clear()
+        this.selAnchor = null
+        this.selectedItem = path
+        this.renderTreeWindow()
+        this.showContext(e, path, kind, [path])
+      }
     })
     // 文件树虚拟化：滚动只重绘可见窗口（rAF 节流）；容器尺寸变化同样重绘
     const treeEl = mustQuery<HTMLElement>(root, '[data-tree]')
@@ -462,6 +553,10 @@ export class NotesApp extends HTMLElement {
       if (!targetClosest(e, '[data-sort-menu]') && !targetClosest(e, '[data-act="sort"]')) this.hideSortMenu()
       if (!targetClosest(e, '[data-more-menu]') && !targetClosest(e, '[data-head-act="more"]') && !targetClosest(e, '.card-more')) this.hideMoreMenu()
       if (!targetClosest(e, '[data-ctx]')) this.hideContext()
+      if (!targetClosest(e, '[data-edit-menu]') && !targetClosest(e, '.edit-sub')) this.hideEditMenu()
+    })
+    root.addEventListener('keydown', (e: Event) => {
+      if ((e as KeyboardEvent).key === 'Escape') this.hideEditMenu()
     })
     root.addEventListener('contextmenu', (e) => {
       if (!targetClosest(e, '[data-tree]')) this.hideContext()
@@ -575,7 +670,7 @@ export class NotesApp extends HTMLElement {
   private flatRowHtml(r: FlatRow, q: string): string {
     const cls = ['t-row']
     if (r.kind === 'folder') cls.push('folder')
-    if (r.sel) cls.push('sel')
+    if (r.sel || this.multiSel.has(r.path)) cls.push('sel') // 主选中或 Shift/Ctrl 多选均高亮
     if (r.cur) cls.push('cur')
     const indent = 'padding-left:' + (r.depth * 14 + 4) + 'px'
     const caret = r.kind === 'folder' ? (r.expanded ? '▾' : '▸') : ''
@@ -606,6 +701,43 @@ export class NotesApp extends HTMLElement {
     for (let i = start; i < end; i++) html.push(this.flatRowHtml(this.flatRows[i], q))
     if (end < total) html.push(`<div class="tree-spacer" style="height:${(total - end) * ROW_H}px"></div>`)
     tree.innerHTML = html.join('')
+  }
+
+  /** 当前选中集（主选中 + 多选），去重保序 */
+  private effectiveSelection(): string[] {
+    const set = new Set<string>()
+    if (this.selectedItem) set.add(this.selectedItem)
+    for (const p of this.multiSel) set.add(p)
+    return [...set]
+  }
+
+  /** Shift 连选：按 flatRows 视口顺序从锚点行到当前行全选（锚点缺省/失效则只选当前行）；不触发打开/展开 */
+  private rangeSelect(path: string): void {
+    const idx = this.flatRows.findIndex((r) => r.path === path)
+    const anchorIdx = this.selAnchor ? this.flatRows.findIndex((r) => r.path === this.selAnchor) : -1
+    const from = anchorIdx >= 0 ? Math.min(anchorIdx, idx) : idx
+    const to = anchorIdx >= 0 ? Math.max(anchorIdx, idx) : idx
+    this.multiSel.clear()
+    for (let i = from; i <= to; i++) this.multiSel.add(this.flatRows[i].path)
+    this.selectedItem = path // 主选中 = 最后点击的行
+    this.selAnchor = path
+    this.renderTreeWindow()
+  }
+
+  /** Ctrl/Cmd 切换：该行加入/移出多选；主选中被切掉时从剩余选中里重选主选中 */
+  private toggleSelect(path: string): void {
+    if (this.multiSel.has(path)) {
+      this.multiSel.delete(path)
+      if (this.selectedItem === path) {
+        const rest = this.effectiveSelection()
+        this.selectedItem = rest.length ? rest[rest.length - 1] : null
+      }
+    } else if (this.selectedItem === path) {
+      this.selectedItem = null // 主选中单独被切掉（允许清空选中）
+    } else {
+      this.multiSel.add(path)
+    }
+    this.renderTreeWindow()
   }
 
   async selectFolder(path: string): Promise<void> {
@@ -1396,6 +1528,25 @@ export class NotesApp extends HTMLElement {
               e.stopPropagation()
               return true
             },
+            click: (e, view) => {
+              // 点击链接：内部笔记路径 → 打开笔记；外部 URL → 系统浏览器（普通/源文件模式均可）
+              if (e.target instanceof Element && e.target.closest('.cm-task-box')) return false
+              const pos = view.posAtCoords({ x: e.clientX, y: e.clientY })
+              if (pos == null) return false
+              const line = view.state.doc.lineAt(pos)
+              const re = /\[[^\]]*\]\(<?([^)\s]+)>?\)|<(https?:\/\/[^>\s]+)>/g
+              let m: RegExpExecArray | null
+              while ((m = re.exec(line.text))) {
+                const start = line.from + m.index
+                const end = start + m[0].length
+                if (pos >= start && pos <= end) {
+                  const url = (m[1] ?? m[2] ?? '').trim()
+                  if (url && !url.startsWith('#')) this.handleLinkClick(url)
+                  return true
+                }
+              }
+              return false
+            },
           }),
           EditorView.updateListener.of((u) => {
             if (!u.docChanged) return
@@ -1627,15 +1778,24 @@ export class NotesApp extends HTMLElement {
   }
 
   // ---------- 右键菜单 ----------
-  showContext(e: MouseEvent, path: string, kind: string): void {
-    this.context = { path, kind }
+  showContext(e: MouseEvent, path: string, kind: string, paths?: string[]): void {
+    const list = paths && paths.length ? paths : [path]
+    this.context = { path, kind, paths: list }
     const ctx = mustQuery<HTMLElement>(this.sr, '[data-ctx]')
-    ctx.innerHTML = [
-      { act: 'copy', label: '复制', icon: ICON_CTX_COPY },
-      { act: 'move', label: '移动', icon: ICON_CTX_MOVE },
-      { act: 'rename', label: '重命名', icon: ICON_CTX_RENAME },
-      { act: 'delete', label: '删除', icon: ICON_CTX_DELETE },
-    ]
+    const multi = list.length > 1
+    // 多选：仅移动/删除（重命名无意义、复制按单选流程）；单选：完整四项
+    const items = multi
+      ? [
+          { act: 'move', label: `移动 (${list.length} 项)`, icon: ICON_CTX_MOVE },
+          { act: 'delete', label: `删除 (${list.length} 项)`, icon: ICON_CTX_DELETE },
+        ]
+      : [
+          { act: 'copy', label: '复制', icon: ICON_CTX_COPY },
+          { act: 'move', label: '移动', icon: ICON_CTX_MOVE },
+          { act: 'rename', label: '重命名', icon: ICON_CTX_RENAME },
+          { act: 'delete', label: '删除', icon: ICON_CTX_DELETE },
+        ]
+    ctx.innerHTML = items
       .map((x) => `<div class="menu-item${x.act === 'delete' ? ' danger' : ''}" data-ctx-act="${x.act}">${x.icon}<span>${x.label}</span></div>`)
       .join('')
     const host = mustQuery<HTMLElement>(this.sr, '.app').getBoundingClientRect()
@@ -1653,37 +1813,482 @@ export class NotesApp extends HTMLElement {
     mustQuery<HTMLElement>(this.sr, '[data-ctx]').classList.remove('show')
   }
 
+  // ---------- 编辑区右键菜单 ----------
+  showEditMenu(e: MouseEvent, paneId: string): void {
+    this.editMenuPaneId = paneId
+    this.renderEditMenu()
+    this.hideContext()
+    this.hideMoreMenu()
+    const menu = mustQuery<HTMLElement>(this.sr, '[data-edit-menu]')
+    const host = mustQuery<HTMLElement>(this.sr, '.app').getBoundingClientRect()
+    const mw = menu.offsetWidth || 180
+    const mh = menu.offsetHeight || 320
+    menu.style.left = Math.min(e.clientX - host.left, host.width - mw - 4) + 'px'
+    menu.style.top = Math.min(e.clientY - host.top, host.height - mh - 4) + 'px'
+    menu.classList.add('show')
+  }
+
+  private renderEditMenu(): void {
+    const sr = this.sr
+    // 重建时清掉旧二级菜单
+    for (const sub of [...sr.querySelectorAll<HTMLElement>('.edit-sub')]) sub.remove()
+    const menu = mustQuery<HTMLElement>(sr, '[data-edit-menu]')
+    // 二级菜单分组：悬停/点击分组项在右侧展开
+    const SUB: Record<string, Array<{ act: string; label: string }>> = {
+      format: [
+        { act: 'bold', label: '加粗' },
+        { act: 'italic', label: '斜体' },
+        { act: 'strike', label: '删除线' },
+        { act: 'code', label: '代码' },
+        { act: 'math', label: '数学' },
+        { act: 'comment', label: '注释' },
+        { act: 'highlight', label: '高亮' },
+      ],
+      para: [
+        { act: 'h1', label: '标题 1' },
+        { act: 'h2', label: '标题 2' },
+        { act: 'h3', label: '标题 3' },
+        { act: 'h4', label: '标题 4' },
+        { act: 'h5', label: '标题 5' },
+        { act: 'h6', label: '标题 6' },
+        { act: 'quote', label: '引用' },
+        { act: 'ul', label: '无序列表' },
+        { act: 'ol', label: '有序列表' },
+      ],
+      insert: [
+        { act: 'footnote', label: '脚注' },
+        { act: 'mark', label: '标注' },
+        { act: 'image', label: '插入图片…' },
+        { act: 'table', label: '表格' },
+        { act: 'hr', label: '分割线' },
+        { act: 'codeblock', label: '代码块' },
+        { act: 'mathblock', label: '数学块' },
+      ],
+      clipboard: [
+        { act: 'copy', label: '复制' },
+        { act: 'cut', label: '剪切' },
+        { act: 'paste', label: '粘贴' },
+        { act: 'paste-plain', label: '以纯文本形式粘贴' },
+        { act: 'select-all', label: '全选' },
+      ],
+    }
+    menu.innerHTML = [
+      '<div class="menu-item" data-edit-act="link-note">新增笔记链接…</div>',
+      '<div class="menu-item" data-edit-act="link-url">新增外部链接…</div>',
+      '<div class="menu-sep"></div>',
+      '<div class="menu-item edit-has-sub" data-edit-group="format">文本格式<span class="edit-caret">▸</span></div>',
+      '<div class="menu-item edit-has-sub" data-edit-group="para">段落设置<span class="edit-caret">▸</span></div>',
+      '<div class="menu-item edit-has-sub" data-edit-group="insert">插入<span class="edit-caret">▸</span></div>',
+      '<div class="menu-item edit-has-sub" data-edit-group="clipboard">剪贴板<span class="edit-caret">▸</span></div>',
+    ].join('')
+    menu.querySelectorAll<HTMLElement>('[data-edit-act]').forEach((el) =>
+      el.addEventListener('click', () => {
+        const pid = this.editMenuPaneId // 先捕获作用面板，再收起（hideEditMenu 会清空该字段）
+        this.hideEditMenu()
+        void this.editAction(el.dataset.editAct!, pid)
+      }),
+    )
+    // 为每个分组创建独立二级菜单（挂 .app 下，避免被主菜单 overflow 裁剪）
+    for (const key of Object.keys(SUB)) {
+      const sub = document.createElement('div')
+      sub.className = 'edit-menu edit-sub'
+      sub.dataset.editSub = key
+      sub.innerHTML = SUB[key].map((x) => `<div class="menu-item" data-edit-act="${x.act}">${x.label}</div>`).join('')
+      sub.querySelectorAll<HTMLElement>('[data-edit-act]').forEach((el) =>
+        el.addEventListener('click', () => {
+          const pid = this.editMenuPaneId // 先捕获作用面板，再收起（hideEditMenu 会清空该字段）
+          this.hideEditMenu()
+          void this.editAction(el.dataset.editAct!, pid)
+        }),
+      )
+      mustQuery<HTMLElement>(sr, '.app').appendChild(sub)
+      const group = menu.querySelector<HTMLElement>(`[data-edit-group="${key}"]`)
+      if (!group) continue
+      // 悬停打开对应二级菜单；打开后保持（不随鼠标移开消失），
+      // 仅「再次点击同一项 / 点击其它一级项 / 点击子项执行 / 点外部 / Esc」时关闭
+      group.addEventListener('mouseenter', () => this.showSubmenu(key, group))
+      group.addEventListener('click', (e) => {
+        e.stopPropagation()
+        if (sub.classList.contains('show')) this.hideSubmenu()
+        else this.showSubmenu(key, group)
+      })
+    }
+  }
+
+  /** 展开指定二级菜单（并收起其它），位置跟随分组项右缘；分组项加选中态 .on */
+  private showSubmenu(key: string, anchor: HTMLElement): void {
+    for (const s of [...this.sr.querySelectorAll<HTMLElement>('.edit-sub')]) s.classList.toggle('show', s.dataset.editSub === key)
+    for (const g of [...this.sr.querySelectorAll<HTMLElement>('[data-edit-group]')]) g.classList.toggle('on', g.dataset.editGroup === key)
+    const sub = this.sr.querySelector<HTMLElement>(`.edit-sub[data-edit-sub="${key}"]`)
+    if (!sub) return
+    const rect = anchor.getBoundingClientRect()
+    const host = mustQuery<HTMLElement>(this.sr, '.app').getBoundingClientRect()
+    sub.style.left = Math.min(rect.right - host.left, host.width - (sub.offsetWidth || 160) - 4) + 'px'
+    sub.style.top = Math.min(rect.top - host.top, host.height - (sub.offsetHeight || 320) - 4) + 'px'
+  }
+
+  private hideSubmenu(): void {
+    for (const s of [...this.sr.querySelectorAll<HTMLElement>('.edit-sub')]) s.classList.remove('show')
+    for (const g of [...this.sr.querySelectorAll<HTMLElement>('[data-edit-group]')]) g.classList.remove('on')
+  }
+
+  hideEditMenu(): void {
+    this.editMenuPaneId = null
+    for (const s of [...this.sr.querySelectorAll<HTMLElement>('.edit-sub')]) s.remove()
+    mustQuery<HTMLElement>(this.sr, '[data-edit-menu]').classList.remove('show')
+  }
+
+  /** 执行编辑区右键动作（作用于 paneId 对应面板的编辑器） */
+  private async editAction(act: string, paneId: string | null): Promise<void> {
+    const rec = paneId ? this.panes.get(paneId) : undefined
+    const view = rec?.editor
+    if (!view) return
+    const selText = (): string => view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to)
+    switch (act) {
+      case 'link-note': {
+        const path = await this.openNoteLinkDialog()
+        if (path) this.insertAtCursor(view, `[${path.split('/').pop()!.replace(/\.md$/i, '')}](${path})`)
+        break
+      }
+      case 'link-url': {
+        const url = await this.openInputDialog('插入外部链接', 'https://…', 'https://')
+        if (url) this.insertAtCursor(view, selText() ? `[${selText()}](${url})` : `[链接](${url})`)
+        break
+      }
+      case 'image': {
+        const url = await this.openInputDialog('插入图片', '图片 URL 或路径', '')
+        if (url) this.insertAtCursor(view, `![${selText() || '图片'}](${url})`)
+        break
+      }
+      case 'bold':
+        this.wrapSelection(view, '**', '**')
+        break
+      case 'italic':
+        this.wrapSelection(view, '*', '*')
+        break
+      case 'strike':
+        this.wrapSelection(view, '~~', '~~')
+        break
+      case 'code':
+        this.wrapSelection(view, '`', '`')
+        break
+      case 'math':
+        this.wrapSelection(view, '$', '$')
+        break
+      case 'comment':
+        this.wrapSelection(view, '<!-- ', ' -->')
+        break
+      case 'highlight':
+        this.wrapSelection(view, '<mark class="hl">', '</mark>')
+        break
+      case 'h1':
+      case 'h2':
+      case 'h3':
+      case 'h4':
+      case 'h5':
+      case 'h6':
+        this.applyHeading(view, Number(act[1]))
+        break
+      case 'quote':
+        this.toggleLinePrefix(view, '> ')
+        break
+      case 'ul':
+        this.toggleLinePrefix(view, '- ')
+        break
+      case 'ol':
+        this.toggleLinePrefix(view, '1. ')
+        break
+      case 'codeblock':
+        this.insertFence(view)
+        break
+      case 'mathblock':
+        this.wrapMathBlock(view)
+        break
+      case 'footnote':
+        this.insertFootnote(view)
+        break
+      case 'mark':
+        this.wrapSelection(view, '<mark>', '</mark>')
+        break
+      case 'table':
+        this.insertAtCursor(view, '| 列1 | 列2 |\n| --- | --- |\n|  |  |')
+        break
+      case 'hr':
+        this.insertAtCursor(view, '\n---\n')
+        break
+      case 'copy':
+        await this.copySelection(view)
+        break
+      case 'cut':
+        await this.cutSelection(view)
+        break
+      case 'paste':
+      case 'paste-plain':
+        await this.pasteFromClipboard(view)
+        break
+      case 'select-all':
+        view.dispatch({ selection: { anchor: 0, head: view.state.doc.length } })
+        break
+    }
+    view.focus()
+  }
+
+  /** 点击链接处理：https 等外部 → 系统浏览器（宿主 windowOpenHandler 已接 https: → shell.openExternal）；内部笔记路径 → 打开笔记 */
+  private handleLinkClick(href: string): void {
+    const url = href.trim()
+    if (!url || url.startsWith('#')) return
+    if (/^(https?:|mailto:|file:)/i.test(url)) {
+      window.open(url, '_blank', 'noopener')
+      return
+    }
+    void this.openNote(normalizePath(url))
+  }
+
+  /** 光标处插入（替换选区；无选区则插在光标处），光标移到插入内容末尾 */
+  private insertAtCursor(view: EditorView, text: string): void {
+    const { from, to } = view.state.selection.main
+    view.dispatch({ changes: { from, to, insert: text }, selection: { anchor: from + text.length } })
+  }
+
+  /** 环绕选区（`**`/`*`/`~~`/`` ` `` 等）；无选区则插入一对标记、光标居中 */
+  private wrapSelection(view: EditorView, before: string, after: string): void {
+    const { from, to } = view.state.selection.main
+    const sel = view.state.sliceDoc(from, to)
+    if (sel) {
+      view.dispatch({
+        changes: { from, to, insert: before + sel + after },
+        selection: { anchor: from + before.length, head: from + before.length + sel.length },
+      })
+    } else {
+      view.dispatch({ changes: { from, to, insert: before + after }, selection: { anchor: from + before.length } })
+    }
+  }
+
+  /** 行前缀切换（引用/列表）：选中范围覆盖的所有行加前缀，已全部有则移除 */
+  private toggleLinePrefix(view: EditorView, prefix: string): void {
+    const re = new RegExp('^' + prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    const { from, to } = view.state.selection.main
+    const start = view.state.doc.lineAt(from)
+    const end = view.state.doc.lineAt(to)
+    const lines: Array<{ no: number; has: boolean }> = []
+    for (let l = start.number; l <= end.number; l++) lines.push({ no: l, has: re.test(view.state.doc.line(l).text) })
+    const all = lines.every((x) => x.has)
+    const changes = lines.map((x) => {
+      const line = view.state.doc.line(x.no)
+      return { from: line.from, to: line.to, insert: all ? line.text.replace(re, '') : x.has ? line.text : prefix + line.text }
+    })
+    view.dispatch({ changes })
+  }
+
+  /** 标题级别：设为指定级别；已是该级别则还原为正文 */
+  private applyHeading(view: EditorView, level: number): void {
+    const prefix = '#'.repeat(level) + ' '
+    const re = /^#{1,6}\s*/
+    const { from, to } = view.state.selection.main
+    const start = view.state.doc.lineAt(from)
+    const end = view.state.doc.lineAt(to)
+    const changes: Array<{ from: number; to: number; insert: string }> = []
+    for (let l = start.number; l <= end.number; l++) {
+      const line = view.state.doc.line(l)
+      changes.push({ from: line.from, to: line.to, insert: line.text.replace(re, (m) => (m === prefix ? '' : prefix)) })
+    }
+    view.dispatch({ changes })
+  }
+
+  /** 围栏代码块：选区内容包进 ```，无选区插入空代码块 */
+  private insertFence(view: EditorView): void {
+    const { from, to } = view.state.selection.main
+    const text = view.state.sliceDoc(from, to)
+    const insert = text ? '```\n' + text + '\n```' : '```\n\n```'
+    view.dispatch({ changes: { from, to, insert }, selection: { anchor: from + insert.length } })
+  }
+
+  /** 数学块：选区内容包进 $$...$$，无选区插入空数学块 */
+  private wrapMathBlock(view: EditorView): void {
+    const { from, to } = view.state.selection.main
+    const text = view.state.sliceDoc(from, to)
+    const insert = text ? '$$\n' + text + '\n$$' : '$$\n\n$$'
+    view.dispatch({ changes: { from, to, insert }, selection: { anchor: from + insert.length } })
+  }
+
+  /** 脚注：光标处插入 `[^N]` 引用，并在文末追加 `[^N]: 脚注内容` 定义（N 取文档现有最大脚注号 +1） */
+  private insertFootnote(view: EditorView): void {
+    const doc = view.state.doc.toString()
+    let max = 0
+    for (const m of doc.matchAll(/\[\^(\d+)\]/g)) max = Math.max(max, Number(m[1]))
+    const n = max + 1
+    const ref = `[^${n}]`
+    const { from, to } = view.state.selection.main
+    view.dispatch({
+      changes: [
+        { from, to, insert: ref },
+        { from: view.state.doc.length, to: view.state.doc.length, insert: `\n\n[^${n}]: 脚注内容` },
+      ],
+      selection: { anchor: from + ref.length },
+    })
+  }
+
+  /** 剪贴板写入降级：navigator.clipboard 失败时用临时 textarea + execCommand('copy')（Electron/受限上下文兜底） */
+  private async clipboardWrite(text: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(text)
+      return
+    } catch {
+      /* 走降级 */
+    }
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    try {
+      document.execCommand('copy')
+    } catch {
+      /* 忽略 */
+    }
+    ta.remove()
+  }
+
+  private async copySelection(view: EditorView): Promise<void> {
+    const text = view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to)
+    if (!text) return
+    await this.clipboardWrite(text)
+  }
+
+  private async cutSelection(view: EditorView): Promise<void> {
+    const { from, to } = view.state.selection.main
+    const text = view.state.sliceDoc(from, to)
+    if (!text) return
+    await this.clipboardWrite(text)
+    view.dispatch({ changes: { from, to, insert: '' } })
+  }
+
+  /** 粘贴（CM 默认以纯文本插入，粘贴与纯文本粘贴同行为） */
+  private async pasteFromClipboard(view: EditorView): Promise<void> {
+    try {
+      const text = await navigator.clipboard.readText()
+      if (text == null) return
+      const { from, to } = view.state.selection.main
+      view.dispatch({ changes: { from, to, insert: text }, selection: { anchor: from + text.length } })
+    } catch {
+      console.error('[notes] 剪贴板读取失败（可能无权限）')
+    }
+  }
+
+  /** 收集已加载目录下的全部笔记（供"新增笔记链接"选择） */
+  private collectNotes(): Array<{ path: string; title: string }> {
+    const out: Array<{ path: string; title: string }> = []
+    const walk = (dir: string): void => {
+      for (const x of this.getSorted(dir)) {
+        if (x.isDirectory) {
+          if (this.tree.has(x.path)) walk(x.path)
+        } else if (x.path.toLowerCase().endsWith('.md')) {
+          out.push({ path: x.path, title: x.path.split('/').pop()!.replace(/\.md$/i, '') })
+        }
+      }
+    }
+    walk(ROOT)
+    return out
+  }
+
+  /** 选择笔记弹窗：可搜索的笔记列表（已加载目录内），点条目/回车选择 */
+  private openNoteLinkDialog(): Promise<string | null> {
+    return new Promise((resolve) => {
+      const notes = this.collectNotes()
+      this.dialog = { title: '选择笔记', mode: 'link', resolve: (v) => resolve(typeof v === 'string' ? v : null), folderValue: '' }
+      const ov = mustQuery<HTMLElement>(this.sr, '[data-overlay]')
+      mustQuery<HTMLElement>(this.sr, '[data-modal-title]').textContent = '选择笔记'
+      mustQuery<HTMLElement>(this.sr, '[data-modal-message]').hidden = true
+      mustQuery<HTMLSelectElement>(this.sr, '[data-modal-select]').hidden = true
+      const input = mustQuery<HTMLInputElement>(this.sr, '[data-modal-input]')
+      input.hidden = false
+      input.value = ''
+      input.placeholder = '搜索笔记…（Enter 选首个）'
+      input.focus()
+      const list = mustQuery<HTMLElement>(this.sr, '[data-modal-folderlist]')
+      list.hidden = false
+      const render = (q: string): void => {
+        const lower = q.trim().toLowerCase()
+        const items = lower
+          ? notes.filter((n) => n.title.toLowerCase().includes(lower) || n.path.toLowerCase().includes(lower))
+          : notes
+        list.innerHTML = items.length
+          ? items
+              .slice(0, 300)
+              .map((n) => `<div class="folder-opt" data-note-opt="${escapeAttr(n.path)}" title="${escapeAttr(n.path)}">${escapeHtml(n.title)}</div>`)
+              .join('')
+          : '<div class="nav-empty">没有匹配的笔记。</div>'
+      }
+      render('')
+      const close = (value: string | null): void => {
+        input.removeEventListener('input', onInput)
+        input.removeEventListener('keydown', onKey)
+        list.removeEventListener('click', onClick)
+        this.dialog = null
+        ov.classList.remove('show')
+        resolve(value)
+      }
+      const onInput = (): void => render(input.value)
+      const onClick = (e: Event): void => {
+        const item = targetClosest<HTMLElement>(e, '[data-note-opt]')
+        if (!item) return
+        close(item.dataset.noteOpt ?? null)
+      }
+      const onKey = (e: KeyboardEvent): void => {
+        if (e.key === 'Enter') {
+          const first = list.querySelector<HTMLElement>('[data-note-opt]')
+          if (first) close(first.dataset.noteOpt ?? null)
+        } else if (e.key === 'Escape') {
+          close(null)
+        }
+      }
+      input.addEventListener('input', onInput)
+      input.addEventListener('keydown', onKey)
+      list.addEventListener('click', onClick)
+      ov.classList.add('show')
+    })
+  }
+
   async ctxAction(act: CtxAction, path: string, _kind: string): Promise<void> {
+    // 多选：作用于右键时整个选中集；单选：[path]
+    const paths = this.context?.paths && this.context.paths.length ? this.context.paths : [path]
     if (act === 'delete') {
+      const multi = paths.length > 1
       const display = path.split('/').pop()!.replace(/\.md$/, '')
-      const ok = await this.openConfirmDialog('删除', `确定删除「${display}」？此操作不可恢复。`)
+      const ok = await this.openConfirmDialog(
+        '删除',
+        multi ? `确定删除选中的 ${paths.length} 项？此操作不可恢复。` : `确定删除「${display}」？此操作不可恢复。`,
+      )
       if (!ok) return
       await this.saveAll() // 先全部落盘，避免删除后防抖写回
-      try {
-        await window.api.pluginFiles.remove(PLUGIN_ID, path)
-      } catch (err) {
-        console.error('[notes] 删除失败', err)
-        return
-      }
-      this.search.remove(path) // 索引同步（含后代）
-      try {
+      // 子路径去重：选中含父子关系时只删父（路径排序父在前）
+      const sorted = [...paths].sort()
+      const toDelete = sorted.filter((p, i) => !sorted.slice(0, i).some((q) => p.startsWith(q + '/')))
+      for (const p of toDelete) {
+        try {
+          await window.api.pluginFiles.remove(PLUGIN_ID, p)
+        } catch (err) {
+          console.error('[notes] 删除失败', p, err)
+          continue
+        }
+        this.search.remove(p) // 索引同步（含后代）
         // 关闭所有打开该路径/其后代的面板（discard 防写回）
         for (const [id, rec] of [...this.panes]) {
-          if (rec.path && (rec.path === path || rec.path.startsWith(path + '/'))) {
+          if (rec.path && (rec.path === p || rec.path.startsWith(p + '/'))) {
             await this.closePane(id, { discard: true })
           }
         }
-        if (this.panes.size === 0) this.resetEditor()
-        // 清理展开状态残留（删除的文件夹及其后代）
-        for (const p of [...this.expanded]) if (p === path || p.startsWith(path + '/')) this.expanded.delete(p)
-        if (this.selectedItem === path || (this.selectedItem && this.selectedItem.startsWith(path + '/'))) this.selectedItem = ROOT
-      } catch (err) {
-        console.error('[notes] 删除后清理异常', err)
-      } finally {
-        // 无论清理是否异常，都强制刷新父目录，避免树节点残留
-        const parent = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : ROOT
-        await this.loadDir(parent)
+        // 清理展开状态 / 选中残留
+        for (const x of [...this.expanded]) if (x === p || x.startsWith(p + '/')) this.expanded.delete(x)
+        if (this.selectedItem === p || (this.selectedItem && this.selectedItem.startsWith(p + '/'))) this.selectedItem = ROOT
+        this.multiSel.delete(p)
       }
+      if (this.panes.size === 0) this.resetEditor()
+      // 刷新涉及的父目录，避免树节点残留
+      const parents = new Set(toDelete.map((p) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : ROOT)))
+      for (const parent of parents) await this.loadDir(parent)
+      this.renderTreeWindow()
       return
     }
     if (act === 'rename') {
@@ -1697,32 +2302,42 @@ export class NotesApp extends HTMLElement {
     if (act === 'move') {
       await this.saveAll()
       const folders = await this.collectAllFolders()
+      const multi = paths.length > 1
       const display = path.split('/').pop()!.replace(/\.md$/, '')
-      const target = await this.openFolderDialog(`移动「${display}」到`, folders, path)
+      // 排除全部选中项及其后代（多选时也不能移入自身子树）
+      const excluded = (f: string) => paths.some((p) => f === p || f.startsWith(p + '/'))
+      const target = await this.openFolderDialog(multi ? `移动选中的 ${paths.length} 项到` : `移动「${display}」到`, folders, excluded)
       if (target == null) return
-      const newPath = (target ? target + '/' : '') + path.split('/').pop()!
-      if (newPath === path) return
-      try {
-        await window.api.pluginFiles.move(PLUGIN_ID, path, newPath)
-        this.search.rename(path, newPath) // 索引同步（含后代）
-        // 打开该路径/后代的面板：重写路径前缀并刷新标题
-        for (const rec of this.panes.values()) {
-          if (rec.path && (rec.path === path || rec.path.startsWith(path + '/'))) {
-            rec.path = newPath + rec.path.slice(path.length)
-            this.updatePaneTitle(rec.id)
+      for (const p of paths) {
+        const newPath = (target ? target + '/' : '') + p.split('/').pop()!
+        if (newPath === p) continue
+        try {
+          await window.api.pluginFiles.move(PLUGIN_ID, p, newPath)
+          this.search.rename(p, newPath) // 索引同步（含后代）
+          // 打开该路径/后代的面板：重写路径前缀并刷新标题
+          for (const rec of this.panes.values()) {
+            if (rec.path && (rec.path === p || rec.path.startsWith(p + '/'))) {
+              rec.path = newPath + rec.path.slice(p.length)
+              this.updatePaneTitle(rec.id)
+            }
           }
+          if (this.selectedItem === p || (this.selectedItem && this.selectedItem.startsWith(p + '/'))) {
+            this.selectedItem = newPath + this.selectedItem.slice(p.length)
+          }
+          if (this.multiSel.has(p)) {
+            this.multiSel.delete(p)
+            this.multiSel.add(newPath)
+          }
+        } catch (err) {
+          console.error('[notes] 移动失败', p, err)
         }
-        if (this.selectedItem && (this.selectedItem === path || this.selectedItem.startsWith(path + '/'))) {
-          this.selectedItem = newPath + this.selectedItem.slice(path.length)
-        }
-        if (target) {
-          this.expanded.add(target) // 移动后自动展开目标文件夹，让文件立即可见
-        }
-        await this.loadDir(ROOT)
-        await this.loadDir(target)
-      } catch (err) {
-        console.error('[notes] 移动失败', err)
       }
+      if (target) {
+        this.expanded.add(target) // 移动后自动展开目标文件夹，让文件立即可见
+      }
+      await this.loadDir(ROOT)
+      await this.loadDir(target)
+      this.renderTreeWindow()
     }
   }
 
@@ -1788,6 +2403,8 @@ export class NotesApp extends HTMLElement {
     this.activeCardId = null
     this.lastActivePaneId = null
     this.filter = ''
+    this.multiSel.clear()
+    this.selAnchor = null
     clearTimer(this.previewTimer)
     this.updateHead() // 回全局占位（含重建）
     const editor = mustQuery<HTMLElement>(this.sr, '.editor')
@@ -1835,7 +2452,7 @@ export class NotesApp extends HTMLElement {
     })
   }
 
-  openFolderDialog(title: string, folders: string[], excludePath: string): Promise<string | null> {
+  openFolderDialog(title: string, folders: string[], exclude: (f: string) => boolean): Promise<string | null> {
     return new Promise((resolve) => {
       // 包装：见 openInputDialog
       this.dialog = { title, mode: 'folder', resolve: (v) => resolve(typeof v === 'string' ? v : null), folderValue: '' }
@@ -1851,7 +2468,7 @@ export class NotesApp extends HTMLElement {
       list.innerHTML =
         '<div class="folder-opt on" data-folder-opt="">根目录</div>' +
         folders
-          .filter((f) => f !== excludePath && !(excludePath && f.startsWith(excludePath + '/')))
+          .filter((f) => !exclude(f))
           .map((f) => `<div class="folder-opt" data-folder-opt="${escapeAttr(f)}" style="padding-left:${depth(f) * 14 + 8}px">${escapeHtml(shortName(f))}</div>`)
           .join('')
       list.hidden = false
@@ -1888,7 +2505,13 @@ export class NotesApp extends HTMLElement {
     const input = mustQuery<HTMLInputElement>(this.sr, '[data-modal-input]')
     const sel = mustQuery<HTMLSelectElement>(this.sr, '[data-modal-select]')
     const value: string | boolean | null =
-      this.dialog.mode === 'confirm' ? true : this.dialog.mode === 'folder' ? (this.dialog.folderValue ?? '') : input.hidden ? sel.value : input.value.trim()
+      this.dialog.mode === 'confirm'
+        ? true
+        : this.dialog.mode === 'folder' || this.dialog.mode === 'link'
+          ? (this.dialog.folderValue ?? '')
+          : input.hidden
+            ? sel.value
+            : input.value.trim()
     this.dialog = null
     mustQuery<HTMLElement>(this.sr, '[data-overlay]').classList.remove('show')
     resolve(value)

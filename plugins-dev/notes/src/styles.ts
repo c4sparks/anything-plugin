@@ -6,6 +6,15 @@ import katexCss from 'katex/dist/katex.min.css'
 export const SHELL_CSS = `
         :host { display: block; width: 100%; height: 100%; min-height: 480px; }
         * { box-sizing: border-box; }
+        /* 文本选区高亮：淡紫（避免与链接/强调的蓝绿混淆；预览区与输入框一致） */
+        ::selection { background: rgba(139, 92, 246, .28); }
+        /* CM 编辑器选区：!important 覆盖 drawSelection base theme 默认（浅 #d7d4f0 / 深 #233 / 灰 #d9d9d9），统一淡紫 */
+        .cm-editor.cm-focused .cm-selectionBackground,
+        .cm-editor .cm-selectionBackground { background: rgba(139, 92, 246, .30) !important; }
+        .cm-editor ::selection { background: rgba(139, 92, 246, .28); }
+        /* 选区层提到内容之上：drawSelection 默认 above:false（在内容下层），
+           代码/表格/高亮等带背景的文本会盖住选区 → 把层 z-index 提上来（不挡鼠标事件） */
+        .cm-editor .cm-selectionLayer { z-index: 3; pointer-events: none; }
         .app {
           width: 100%; height: 100%; min-height: inherit;
           display: flex;
@@ -25,8 +34,11 @@ export const SHELL_CSS = `
         .side.collapsed .toolbar { flex-direction: column; gap: 2px; justify-content: flex-start; }
         .side.collapsed .toolbar .icon-btn:not([data-act="toggle-side"]) { display: none; }
         .side.collapsed .tree { display: none; }
-        .splitter { flex: none; width: 5px; cursor: col-resize; background: transparent; transition: background var(--duration-fast, 120ms) ease; }
-        .splitter:hover, .splitter.dragging { background: var(--accent, #0e7c6b); opacity: .55; }
+        .splitter { flex: none; width: 5px; cursor: col-resize; position: relative; background: transparent; }
+        /* 侧栏/编辑区分隔条：平时不可见，悬停/拖动显示 1px 浅紫细线（与分屏分割线同色系），拖动加深 */
+        .splitter::before { content: ''; position: absolute; top: 0; bottom: 0; left: 2px; width: 1px; background: transparent; transition: background var(--duration-fast, 120ms) ease; }
+        .splitter:hover::before { background: #b7a3f0; }
+        .splitter.dragging::before { background: #8b5cf6; }
         .toolbar { display: flex; align-items: center; gap: var(--space-1, 4px); padding: 4px; border-bottom: 1px solid var(--border, #d9dce2); flex-wrap: wrap; }
         .icon-btn {
           width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center;
@@ -233,10 +245,23 @@ export const SHELL_CSS = `
         .cm-line span.cm-live-link { color: var(--accent, #0e7c6b); text-decoration: underline; cursor: pointer; }
         .cm-line span.cm-live-del { text-decoration: line-through; }
         .cm-line span.cm-live-img { color: var(--accent, #0e7c6b); font-style: italic; }
+        /* 编辑区右键菜单插入项所见即所得：高亮/标注淡紫、数学样式、脚注上标 */
+        .cm-line span.cm-live-hl { background: rgba(139, 92, 246, .22); border-radius: 2px; }
+        .cm-line span.cm-live-math { font-family: var(--font-mono, monospace); font-style: italic; color: var(--accent, #0e7c6b); }
+        .cm-line.cm-live-math-block { font-family: var(--font-mono, monospace); font-style: italic; color: var(--accent, #0e7c6b); }
+        .cm-line span.cm-live-fn { font-size: 10px; vertical-align: super; }
         .cm-line.cm-live-hr { border-top: 1px solid var(--border-strong, #b6bcc7); }
-        .cm-line.cm-live-table { background: var(--surface-2, #eceef1); }
-        .cm-line.cm-live-table-head { font-weight: 600; }
-        .cm-live-tbl-sep { display: inline-block; width: 8px; margin: 0 3px; border-left: 1px solid var(--border-strong, #b6bcc7); height: 1em; vertical-align: middle; }
+        /* 表格：格子化外观（行底边框 + 左右边框 + 表头下边框线 + 列分隔 widget） */
+        .cm-line.cm-live-table {
+          background: var(--surface-2, #eceef1);
+          border-left: 1px solid var(--border-strong, #b6bcc7);
+          border-right: 1px solid var(--border-strong, #b6bcc7);
+          border-bottom: 1px solid var(--border-strong, #b6bcc7);
+        }
+        .cm-line.cm-live-table-head { font-weight: 600; border-top: 1px solid var(--border-strong, #b6bcc7); border-bottom: none; }
+        /* 分隔行 |---|：内容已隐藏，行压成表头下边框线 */
+        .cm-line.cm-live-tbl-sep { height: 0; line-height: 0; font-size: 0; overflow: hidden; border-bottom: 1px solid var(--border-strong, #b6bcc7); }
+        .cm-live-tbl-sep { display: inline-block; width: 8px; margin: 0 3px; border-left: 1px solid var(--border-strong, #b6bcc7); height: 1.1em; vertical-align: middle; }
         .cm-line.cm-live-task-done { color: var(--text-muted, #5b6370); text-decoration: line-through; }
         /* 任务复选框（可点击切换完成态） */
         .cm-task-box {
@@ -265,6 +290,8 @@ export const SHELL_CSS = `
         .preview hr { border: none; border-top: 1px solid var(--border, #d9dce2); margin: 1em 0; }
         .preview a { color: var(--accent, #0e7c6b); }
         .preview .nav-hl, .nav-outline mark { background: #ffd54d; color: #3a2d00; border-radius: 2px; padding: 0 1px; font-weight: 600; }
+        /* 文本格式-高亮：淡紫底（半透明紫，深浅主题自适应；不与链接/强调的蓝绿混淆） */
+        .preview mark.hl { background: rgba(139, 92, 246, .22); border-radius: 2px; padding: 0 1px; }
         .nav-pane { flex: none; width: 220px; border-left: 1px solid var(--border, #d9dce2); background: var(--surface-2, #eceef1); display: flex; flex-direction: column; min-height: 0; }
         .nav-pane.hidden { display: none; }
         .nav-toolbar { padding: var(--space-2, 8px); border-bottom: 1px solid var(--border, #d9dce2); }
@@ -287,6 +314,16 @@ export const SHELL_CSS = `
         .ctx.show { display: block; }
         .ctx .menu-item { display: flex; align-items: center; gap: var(--space-2, 8px); }
         .ctx .menu-item svg { width: 14px; height: 14px; flex: none; }
+        /* 编辑区右键菜单（新增链接/文本格式/段落设置/插入/剪贴板；分组项带二级菜单） */
+        .edit-menu { position: absolute; z-index: 45; min-width: 176px; max-height: 60vh; overflow-y: auto; background: var(--surface, #fff); border: 1px solid var(--border, #d9dce2); border-radius: var(--radius-base, 6px); box-shadow: var(--shadow-2, 0 6px 20px rgba(16,20,28,.12)); padding: 4px; display: none; }
+        .edit-menu.show { display: block; }
+        .edit-menu .edit-group { padding: 6px var(--space-3, 12px) 2px; font-size: 11px; color: var(--text-muted, #5b6370); font-weight: var(--font-weight-semibold, 600); }
+        .edit-menu .menu-sep { height: 1px; margin: 4px 6px; background: var(--border, #d9dce2); }
+        .edit-menu .edit-has-sub:hover { background: var(--surface-2, #eceef1); }
+        /* 一级分组项选中态（其二级菜单展开时） */
+        .edit-menu .edit-has-sub.on { background: var(--surface-2, #eceef1); color: var(--accent, #0e7c6b); }
+        .edit-menu .edit-caret { margin-left: auto; opacity: .55; font-size: 11px; }
+        .edit-sub { position: absolute; z-index: 46; }
         .ctx .menu-item.danger { color: var(--danger, #b3372e); }
         /* 弹层 */
         .overlay { position: absolute; inset: 0; z-index: 50; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.25); }

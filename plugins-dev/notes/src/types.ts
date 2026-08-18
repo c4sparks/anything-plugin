@@ -88,7 +88,7 @@ export interface SortOption {
   label: string
 }
 
-export type DialogMode = 'input' | 'folder' | 'confirm'
+export type DialogMode = 'input' | 'folder' | 'confirm' | 'link'
 
 /** 弹层状态（输入/选文件夹/确认） */
 export interface DialogState {
@@ -106,6 +106,8 @@ export interface DialogState {
 export interface ContextState {
   path: string
   kind: string
+  /** 操作目标路径集：右键落在多选选中集内时为全部选中路径，单选为 [path] */
+  paths?: string[]
 }
 
 /** 更多菜单动作 */

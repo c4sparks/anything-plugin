@@ -74,9 +74,14 @@ class LivePreviewPlugin {
     const lineCls = (lineNo: number, cls: string) => {
       lineClasses.set(lineNo, ((lineClasses.get(lineNo) || '') + ' ' + cls).trim())
     }
+    // 代码范围（行内/围栏/缩进代码）：正则装饰需跳过，避免把代码里的 `$`/`<mark>`/`[^N]` 误装饰
+    const codeRanges: Array<[number, number]> = []
     tree.iterate({
       enter: (n: SyntaxNodeRef) => {
         const name = n.name
+        if (name === 'FencedCode' || name === 'CodeBlock' || name === 'InlineCode' || name === 'CodeMark' || name === 'CodeText') {
+          codeRanges.push([n.from, n.to])
+        }
         const m = /^ATXHeading([1-6])$/.exec(name)
         if (m) {
           let cur = n.node.firstChild
@@ -221,8 +226,10 @@ class LivePreviewPlugin {
               if (cur.name === 'TableDelimiter') {
                 const txt = state.sliceDoc(cur.from, cur.to)
                 if (txt.length > 1 && /-/.test(txt)) {
+                  // 分隔行 `|---|`：内容隐藏，行压成表头下边框线
                   const l = state.doc.lineAt(cur.from)
                   hideRange(l.from, l.to)
+                  lineCls(l.number, 'cm-live-tbl-sep')
                 } else {
                   decos.push(Decoration.replace({ widget: new TableSepWidget() }).range(cur.from, cur.to))
                 }
@@ -304,6 +311,56 @@ class LivePreviewPlugin {
         }
       },
     })
+    // —— 扩展行内构造（编辑区右键菜单插入项）所见即所得 ——
+    // 语法树覆盖不到的 HTML 高亮/标注、注释、数学、脚注等用正则装饰；代码范围内跳过
+    const docText = state.doc.toString()
+    const inCode = (pos: number): boolean => codeRanges.some(([a, b]) => pos >= a && pos < b)
+    let m: RegExpExecArray | null
+    // 高亮/标注 <mark…>…</mark>：隐藏标签、内容淡蓝底
+    const markRe = /<mark(?:\s+class="[^"]*")?>/g
+    while ((m = markRe.exec(docText))) {
+      if (inCode(m.index)) continue
+      const openEnd = m.index + m[0].length
+      const closeIdx = docText.indexOf('</mark>', openEnd)
+      if (closeIdx === -1) continue
+      hideRange(m.index, openEnd)
+      hideRange(closeIdx, closeIdx + '</mark>'.length)
+      addMark(openEnd, closeIdx, 'cm-live-hl')
+      markRe.lastIndex = closeIdx + '</mark>'.length // 跳过内容区，防二次匹配
+    }
+    // 注释 <!-- … -->：整段隐藏
+    const commentRe = /<!--[\s\S]*?-->/g
+    while ((m = commentRe.exec(docText))) {
+      if (inCode(m.index)) continue
+      hideRange(m.index, m.index + m[0].length)
+    }
+    // 行内数学 $…$：隐藏 `$` 标记、内容数学样式
+    const mathRe = /\$(?!\s)([^$\n]+?)(?<!\s)\$(?![\d$])/g
+    while ((m = mathRe.exec(docText))) {
+      if (inCode(m.index)) continue
+      hideRange(m.index, m.index + 1)
+      hideRange(m.index + m[0].length - 1, m.index + m[0].length)
+      addMark(m.index + 1, m.index + m[0].length - 1, 'cm-live-math')
+    }
+    // 块级数学 $$…$$：隐藏标记、内容行样式
+    const mathBlockRe = /\$\$([\s\S]+?)\$\$/g
+    while ((m = mathBlockRe.exec(docText))) {
+      if (inCode(m.index)) continue
+      hideRange(m.index, m.index + 2)
+      hideRange(m.index + m[0].length - 2, m.index + m[0].length)
+      const fl = state.doc.lineAt(m.index).number
+      const tl = state.doc.lineAt(Math.max(m.index, m.index + m[0].length - 1)).number
+      for (let l = fl; l <= tl; l++) lineCls(l, 'cm-live-math-block')
+      mathBlockRe.lastIndex = m.index + m[0].length // 防块内 `$` 干扰
+    }
+    // 脚注引用 [^N]：隐藏括号、数字上标
+    const fnRe = /\[\^(\d+)\]/g
+    while ((m = fnRe.exec(docText))) {
+      if (inCode(m.index)) continue
+      hideRange(m.index, m.index + 2)
+      hideRange(m.index + m[0].length - 1, m.index + m[0].length)
+      addMark(m.index + 2, m.index + m[0].length - 1, 'cm-live-fn')
+    }
     for (const [ln, cls] of lineClasses) {
       decos.push(Decoration.line({ class: cls }).range(state.doc.line(ln).from))
     }

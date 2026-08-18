@@ -15,7 +15,8 @@ export const editorTheme = EditorView.theme(
     '.cm-activeLineGutter': { backgroundColor: 'var(--surface-2)' },
     '.cm-gutters': { backgroundColor: 'var(--surface)', color: 'var(--text-muted)', borderRight: '1px solid var(--border)' },
     '.cm-lineNumbers .cm-gutterElement': { color: 'var(--text-muted)' },
-    '&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection': { backgroundColor: 'var(--focus-ring)' },
+    // 选区颜色由 styles.ts 以 .cm-editor + !important 覆盖 drawSelection 默认（base theme），
+    // 这里不放 &light/&dark 键——EditorView.theme() 不支持该选择器，会抛 RangeError 导致插件加载失败
     '.cm-matchingBracket': { backgroundColor: 'var(--surface-2)', outline: '1px solid var(--border-strong)' },
     '.cm-placeholder': { color: 'var(--text-muted)', fontStyle: 'italic' },
   },
